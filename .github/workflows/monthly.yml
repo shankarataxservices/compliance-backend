@@ -1,0 +1,12 @@
+name: Monthly Summary
+on:
+  schedule:
+    - cron: "30 0 1 * *" # ~06:00 IST on 1st
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call monthly summary
+        run: |
+          curl -X POST "https://compliance-backend.netlify.app/api/jobs_monthlySummary" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}"
