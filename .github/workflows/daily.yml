@@ -1,0 +1,12 @@
+name: Daily Jobs
+on:
+  schedule:
+    - cron: "30 23 * * *" # ~05:00 IST
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call daily job
+        run: |
+          curl -X POST "https://compliance-backend.netlify.app/api/jobs_daily" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}"
