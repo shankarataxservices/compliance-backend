@@ -1,5 +1,6 @@
 const admin = require('firebase-admin');
 const { google } = require('googleapis');
+const { Readable } = require('stream');
 
 let inited = false;
 
@@ -23,6 +24,45 @@ function calendar() { return google.calendar({ version: 'v3', auth: oauthClient(
 function gmail() { return google.gmail({ version: 'v1', auth: oauthClient() }); }
 function drive() { return google.drive({ version: 'v3', auth: oauthClient() }); }
 
+/** CORS helpers */
+function corsHeaders(event) {
+  const origin = event?.headers?.origin || event?.headers?.Origin || '*';
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Vary': 'Origin',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-cron-secret',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Max-Age': '86400',
+  };
+}
+
+function json(event, statusCode, body) {
+  return {
+    statusCode,
+    headers: { ...corsHeaders(event), 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  };
+}
+
+/** Wrap every function with: OPTIONS + try/catch + always CORS */
+function withCors(handler) {
+  return async (event, context) => {
+    if (event.httpMethod === 'OPTIONS') {
+      return { statusCode: 204, headers: corsHeaders(event), body: '' };
+    }
+    try {
+      const res = await handler(event, context);
+
+      // Ensure CORS headers exist even if handler returned a raw object
+      res.headers = { ...corsHeaders(event), ...(res.headers || {}) };
+      return res;
+    } catch (e) {
+      console.error('Function crashed:', e);
+      return json(event, 500, { ok: false, error: e.message || String(e) });
+    }
+  };
+}
+
 function ymd(d) {
   const x = new Date(d);
   x.setHours(0,0,0,0);
@@ -38,30 +78,6 @@ function addDays(date, days) {
   return d;
 }
 
-function addInterval(baseDate, recurrence, i) {
-  const d = new Date(baseDate);
-  if (i === 0) return d;
-  if (recurrence === 'WEEKLY') d.setDate(d.getDate() + i * 7);
-  else if (recurrence === 'MONTHLY') d.setMonth(d.getMonth() + i);
-  else if (recurrence === 'QUARTERLY') d.setMonth(d.getMonth() + i * 3);
-  else if (recurrence === 'HALF_YEARLY') d.setMonth(d.getMonth() + i * 6);
-  else if (recurrence === 'YEARLY') d.setFullYear(d.getFullYear() + i);
-  else d.setDate(d.getDate() + i); // AD_HOC fallback
-  return d;
-}
-
-function cors() {
-  return {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-cron-secret',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
-  };
-}
-
-function json(statusCode, body) {
-  return { statusCode, headers: { ...cors(), 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
-}
-
 async function auditLog({ taskId, action, actorUid, actorEmail, details }) {
   await db().collection('auditLogs').add({
     taskId: taskId || null,
@@ -73,66 +89,46 @@ async function auditLog({ taskId, action, actorUid, actorEmail, details }) {
   });
 }
 
-// Build raw MIME email (supports attachments)
-function buildRawEmail({ from, to, cc = [], bcc = [], subject, html, attachments = [] }) {
-  const boundary = `----cm_${Date.now()}`;
-  const headers = [
+function buildRawEmail({ from, to, cc = [], bcc = [], subject, html }) {
+  const msg = [
     `From: ${from}`,
     `To: ${to.join(', ')}`,
     cc.length ? `Cc: ${cc.join(', ')}` : '',
     bcc.length ? `Bcc: ${bcc.join(', ')}` : '',
+    'MIME-Version: 1.0',
+    'Content-Type: text/html; charset="UTF-8"',
     `Subject: ${subject}`,
-    'MIME-Version: 1.0'
-  ].filter(Boolean);
-
-  if (!attachments.length) {
-    const msg = [
-      ...headers,
-      'Content-Type: text/html; charset="UTF-8"',
-      '',
-      html
-    ].join('\n');
-    return Buffer.from(msg).toString('base64').replace(/\+/g,'-').replace(/\//g,'_');
-  }
-
-  const parts = [];
-  parts.push(`--${boundary}`);
-  parts.push('Content-Type: text/html; charset="UTF-8"\n');
-  parts.push(html + '\n');
-
-  for (const a of attachments) {
-    parts.push(`--${boundary}`);
-    parts.push(`Content-Type: ${a.mimeType}; name="${a.filename}"`);
-    parts.push('Content-Transfer-Encoding: base64');
-    parts.push(`Content-Disposition: attachment; filename="${a.filename}"\n`);
-    parts.push(a.contentBase64 + '\n');
-  }
-
-  parts.push(`--${boundary}--`);
-
-  const msg = [
-    ...headers,
-    `Content-Type: multipart/mixed; boundary="${boundary}"`,
     '',
-    parts.join('\n')
-  ].join('\n');
+    html
+  ].filter(Boolean).join('\n');
 
   return Buffer.from(msg).toString('base64').replace(/\+/g,'-').replace(/\//g,'_');
 }
 
-async function sendEmail({ to, cc = [], bcc = [], subject, html, attachments = [] }) {
+async function sendEmail({ to, cc = [], bcc = [], subject, html }) {
   if (!to?.length) return;
   const g = gmail();
   const raw = buildRawEmail({
     from: process.env.BOT_FROM,
-    to, cc, bcc, subject, html, attachments
+    to, cc, bcc, subject, html,
   });
-
   await g.users.messages.send({ userId: 'me', requestBody: { raw } });
 }
 
+async function driveUpload({ folderId, filename, mimeType, buffer }) {
+  const d = drive();
+  const res = await d.files.create({
+    requestBody: { name: filename, parents: [folderId] },
+    media: { mimeType, body: Readable.from(buffer) },
+    fields: 'id, webViewLink, size, mimeType, name'
+  });
+  return res.data;
+}
+
 module.exports = {
-  admin, db, auth, calendar, drive, gmail,
-  ymd, addDays, addInterval,
-  json, cors, auditLog, sendEmail
+  admin, db, auth, calendar, gmail, drive,
+  withCors, json,
+  ymd, addDays,
+  auditLog, sendEmail,
+  driveUpload
 };
