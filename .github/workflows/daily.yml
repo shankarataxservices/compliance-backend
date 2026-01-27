@@ -1,12 +1,25 @@
-name: Daily Jobs
+name: Daily 5AM IST
 on:
   schedule:
-    - cron: "30 23 * * *" # ~05:00 IST
+    - cron: "30 23 * * *"  # 23:30 UTC = 05:00 IST (next day)
+  workflow_dispatch:        # Manual trigger
+    inputs:
+      force:
+        description: 'Force run (ignore last run date)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+        - 'false'
+        - 'true'
+
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Call daily job
+      - name: Trigger daily job
         run: |
-          curl -X POST "https://compliance-backend.netlify.app/api/jobs_daily" \
-            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}"
+          curl -X POST "https://compliance-backend.netlify.app/.netlify/functions/jobs_daily5am" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
+            -H "Content-Type: application/json" \
+            --data '{"force":${{ github.event.inputs.force || false }}}'

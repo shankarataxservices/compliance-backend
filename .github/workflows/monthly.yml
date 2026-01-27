@@ -1,12 +1,25 @@
-name: Monthly Summary
+name: Monthly 6AM IST
 on:
   schedule:
-    - cron: "30 0 1 * *" # ~06:00 IST on 1st
+    - cron: "30 0 1 * *"  # 00:30 UTC on 1st = 06:00 IST on 1st
+  workflow_dispatch:       # Manual trigger
+    inputs:
+      force:
+        description: 'Force run (ignore last run date)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+        - 'false'
+        - 'true'
+
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Call monthly summary
+      - name: Trigger monthly job
         run: |
-          curl -X POST "https://compliance-backend.netlify.app/api/jobs_monthlySummary" \
-            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}"
+          curl -X POST "https://compliance-backend.netlify.app/.netlify/functions/jobs_monthlysummary" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
+            -H "Content-Type: application/json" \
+            --data '{"force":${{ github.event.inputs.force || false }}}'
