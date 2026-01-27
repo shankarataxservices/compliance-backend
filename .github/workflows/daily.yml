@@ -22,4 +22,8 @@ jobs:
           curl -X POST "https://compliance-backend.netlify.app/.netlify/functions/jobs_daily5am" \
             -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
             -H "Content-Type: application/json" \
+<<<<<<< HEAD
             --data '{"force":${{ github.event.inputs.force || false }}}'
+=======
+            --data '{"force":${{ github.event.inputs.force || false }}}'
+>>>>>>> a9b4a119621c12a3138d46111a822d3432f6067f
