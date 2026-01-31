@@ -19,7 +19,7 @@ jobs:
     steps:
       - name: Trigger daily job
         run: |
-          curl -X POST "https://compliance-backend.netlify.app/.netlify/functions/jobs_daily5am" \
+          curl -X POST "https://investigators-burlington-button-harvest.trycloudflare.com/.netlify/functions/jobs_daily5am" \
             -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
             -H "Content-Type: application/json" \
             --data '{"force":${{ github.event.inputs.force || false }}}'
