@@ -1,22 +1,105 @@
-const { withCors, json, db, ymd, addDays, sendEmail, auditLog, admin } = require('./_common');
+const {
+  withCors, json, db,
+  ymdIST, ymdToDmy,
+  addDays, dateFromYmdIST,
+  sendEmail
+} = require('./_common');
+
 const { requireCron } = require('./_auth');
 
 function uniq(arr) { return [...new Set((arr||[]).map(x=>String(x).trim()).filter(Boolean))]; }
 
-function renderTemplate(str, vars) {
-  return String(str || '')
-    .replaceAll('{{clientName}}', vars.clientName || '')
-    .replaceAll('{{taskTitle}}', vars.taskTitle || '')
-    .replaceAll('{{startDate}}', vars.startDate || '')
-    .replaceAll('{{dueDate}}', vars.dueDate || '');
+function groupTasksForDigest(tasks, todayYmd) {
+  const sections = {
+    overdue: [],
+    dueToday: [],
+    dueIn3: [],
+    dueIn7: [],
+    dueIn15: [],
+    dueIn30: [],
+    approvalPending: [],
+  };
+
+  const toMidnight = (ymd) => new Date(`${ymd}T00:00:00+05:30`).getTime(); // IST anchored
+  const t0 = toMidnight(todayYmd);
+
+  for (const t of tasks) {
+    if (!t.dueDateYmd) continue;
+
+    if (t.status === 'APPROVAL_PENDING') sections.approvalPending.push(t);
+
+    const d0 = toMidnight(t.dueDateYmd);
+    const diffDays = Math.floor((d0 - t0) / (24 * 3600 * 1000));
+
+    if (t.status === 'COMPLETED') continue;
+
+    if (diffDays < 0) sections.overdue.push({ ...t, diffDays });
+    else if (diffDays === 0) sections.dueToday.push({ ...t, diffDays });
+    else if (diffDays <= 3) sections.dueIn3.push({ ...t, diffDays });
+    else if (diffDays <= 7) sections.dueIn7.push({ ...t, diffDays });
+    else if (diffDays <= 15) sections.dueIn15.push({ ...t, diffDays });
+    else if (diffDays <= 30) sections.dueIn30.push({ ...t, diffDays });
+  }
+
+  const sortByDue = (a,b)=>String(a.dueDateYmd||'').localeCompare(String(b.dueDateYmd||''));
+  Object.keys(sections).forEach(k => sections[k].sort(sortByDue));
+
+  return sections;
 }
 
-function buildDigestHtml(tasks) {
-  const lines = tasks
-    .sort((a,b)=>String(a.dueDateYmd||'').localeCompare(String(b.dueDateYmd||'')))
-    .map(t => `<li><b>${t.title}</b> — Client: ${t.clientId} — Start ${t.startDateYmd} — Due ${t.dueDateYmd} — <b>${t.status}</b></li>`)
-    .join('');
-  return `<p>Tasks requiring action:</p><ul>${lines || '<li>None</li>'}</ul>`;
+async function loadClientsMap(clientIds) {
+  const ids = uniq(clientIds);
+  const map = new Map();
+  if (!ids.length) return map;
+
+  // Firestore Admin supports getAll
+  const refs = ids.map(id => db().collection('clients').doc(id));
+  const snaps = await db().getAll(...refs);
+
+  snaps.forEach(s => {
+    if (s.exists) map.set(s.id, s.data());
+  });
+
+  return map;
+}
+
+function renderSection(title, items, clientsMap) {
+  const li = (t) => {
+    const c = clientsMap.get(t.clientId) || {};
+    const clientName = c.name || t.clientId || '';
+    const due = ymdToDmy(t.dueDateYmd);
+    const start = ymdToDmy(t.startDateYmd);
+    const assignee = t.assignedToEmail || '';
+    const status = t.status || '';
+    const note = (t.statusNote || '').trim();
+    return `<li>
+      <b>${escapeHtml(t.title || '')}</b>
+      <div style="color:#555;font-size:12px;margin-top:2px">
+        Client: ${escapeHtml(clientName)} |
+        Start: ${escapeHtml(start)} |
+        Due: <b>${escapeHtml(due)}</b> |
+        Status: <b>${escapeHtml(status)}</b> |
+        Assignee: ${escapeHtml(assignee)}
+      </div>
+      ${note ? `<div style="color:#666;font-size:12px;margin-top:2px">Note: ${escapeHtml(note)}</div>` : ``}
+      <div style="color:#888;font-size:12px;margin-top:2px">TaskId: ${escapeHtml(t.id || '')}</div>
+    </li>`;
+  };
+
+  if (!items.length) return '';
+  return `
+    <h3 style="margin:14px 0 6px">${escapeHtml(title)} (${items.length})</h3>
+    <ul style="margin:0 0 10px 18px;padding:0">${items.map(li).join('')}</ul>
+  `;
+}
+
+function escapeHtml(s) {
+  return String(s || '')
+    .replaceAll('&','&amp;')
+    .replaceAll('<','&lt;')
+    .replaceAll('>','&gt;')
+    .replaceAll('"','&quot;')
+    .replaceAll("'",'&#039;');
 }
 
 exports.handler = withCors(async (event) => {
@@ -28,9 +111,8 @@ exports.handler = withCors(async (event) => {
   const body = event.body ? JSON.parse(event.body) : {};
   const force = !!body.force;
 
-  const todayYmd = ymd(new Date());
+  const todayYmd = ymdIST(new Date());
 
-  // settings are only for INTERNAL daily digest
   const settingsRef = db().collection('settings').doc('notifications');
   const settingsSnap = await settingsRef.get();
   const settings = settingsSnap.exists ? settingsSnap.data() : {
@@ -41,65 +123,15 @@ exports.handler = withCors(async (event) => {
   };
 
   if (!force && settings.lastDailyRunYmd === todayYmd) {
-    return json(event, 200, { ok:true, skipped:true, reason:'Already ran today' });
+    return json(event, 200, { ok:true, skipped:true, reason:'Already ran today', todayYmd });
   }
 
   const activeStatuses = ['PENDING','IN_PROGRESS','CLIENT_PENDING','APPROVAL_PENDING'];
 
-  // ========= PART 1: CLIENT START MAILS (send only on start date, once) =========
-  // Query minimal fields to reduce index requirements:
-  const startSnap = await db().collection('tasks')
-    .where('startDateYmd', '==', todayYmd)
-    .where('clientStartMailSent', '==', false)
-    .get();
-
-  let clientMailsSent = 0;
-
-  for (const doc of startSnap.docs) {
-    const t = doc.data();
-    if (!activeStatuses.includes(t.status)) continue;
-
-    // If no template in CSV, don't mail.
-    if (!t.clientStartSubject && !t.clientStartBody) continue;
-
-    const cSnap = await db().collection('clients').doc(t.clientId).get();
-    const client = cSnap.exists ? cSnap.data() : {};
-    if (!client.primaryEmail) continue;
-
-    const vars = {
-      clientName: client.name || '',
-      taskTitle: t.title || '',
-      startDate: t.startDateYmd || '',
-      dueDate: t.dueDateYmd || ''
-    };
-
-    const subject = renderTemplate(t.clientStartSubject || `We have started work on {{taskTitle}}`, vars);
-    const html = renderTemplate(
-      t.clientStartBody || `Dear {{clientName}},<br><br>We have started working on <b>{{taskTitle}}</b>.<br>Due date: <b>{{dueDate}}</b>.<br><br>Regards,<br>Compliance Team`,
-      vars
-    );
-
-    await sendEmail({
-      to: [client.primaryEmail],
-      cc: client.ccEmails || [],
-      bcc: client.bccEmails || [],
-      subject,
-      html
-    });
-
-    await doc.ref.update({
-      clientStartMailSent: true,
-      clientStartMailSentAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    await auditLog({ taskId: doc.id, action:'EMAIL_SENT', actorUid:null, actorEmail:null, details:{ type:'CLIENT_START' } });
-    clientMailsSent++;
-  }
-
-  // ========= PART 2: INTERNAL DAILY DIGEST (optional) =========
   const windowDays = Number(settings.dailyWindowDays || 30);
-  const endYmd = ymd(addDays(new Date(), windowDays));
+  const endYmd = ymdIST(addDays(dateFromYmdIST(todayYmd), windowDays));
 
+  // Pull: due within window + overdue + approval pending
   const dueSoonSnap = await db().collection('tasks')
     .where('status', 'in', activeStatuses)
     .where('dueDateYmd', '>=', todayYmd)
@@ -111,38 +143,74 @@ exports.handler = withCors(async (event) => {
     .where('dueDateYmd', '<', todayYmd)
     .get();
 
-  const digestTasks = [
+  const tasks = [
     ...dueSoonSnap.docs.map(d => ({ id:d.id, ...d.data() })),
     ...overdueSnap.docs.map(d => ({ id:d.id, ...d.data() })),
   ];
 
-  // Group by assignee
+  // Load all clients once for better digest output
+  const clientsMap = await loadClientsMap(tasks.map(t => t.clientId));
+
+  const sections = groupTasksForDigest(tasks, todayYmd);
+
+  // Group per assignee
   const byAssignee = new Map();
-  for (const t of digestTasks) {
-    const key = t.assignedToEmail || '';
-    if (!key) continue;
-    if (!byAssignee.has(key)) byAssignee.set(key, []);
-    byAssignee.get(key).push(t);
+  for (const t of tasks) {
+    const email = String(t.assignedToEmail || '').trim();
+    if (!email) continue;
+    if (!byAssignee.has(email)) byAssignee.set(email, []);
+    byAssignee.get(email).push(t);
   }
 
   const internalExtra = uniq(settings.dailyInternalEmails || []);
 
+  const subject = `Daily Digest (${ymdToDmy(todayYmd)})`;
+
+  const makeHtml = (list) => {
+    const s = groupTasksForDigest(list, todayYmd);
+    return `
+      <div style="font-family:Arial,sans-serif;line-height:1.35">
+        <h2 style="margin:0 0 6px">Firm Task Digest — ${escapeHtml(ymdToDmy(todayYmd))}</h2>
+        <div style="color:#555;font-size:12px;margin-bottom:10px">
+          Window: next ${windowDays} days + overdue. Statuses: ${activeStatuses.join(', ')}
+        </div>
+
+        ${renderSection('Overdue', s.overdue, clientsMap)}
+        ${renderSection('Due Today', s.dueToday, clientsMap)}
+        ${renderSection('Due in 1–3 days', s.dueIn3, clientsMap)}
+        ${renderSection('Due in 4–7 days', s.dueIn7, clientsMap)}
+        ${renderSection('Due in 8–15 days', s.dueIn15, clientsMap)}
+        ${renderSection('Due in 16–30 days', s.dueIn30, clientsMap)}
+        ${renderSection('Approval Pending', s.approvalPending, clientsMap)}
+
+        <hr style="border:none;border-top:1px solid #ddd;margin:14px 0">
+        <div style="color:#777;font-size:12px">
+          Tip: Use the web app to filter by client/status/date.
+        </div>
+      </div>
+    `;
+  };
+
+  let sentToAssignees = 0;
   if (settings.sendDailyToAssignees !== false) {
     for (const [email, list] of byAssignee.entries()) {
       await sendEmail({
         to: [email],
-        subject: `Daily Task Digest (${todayYmd})`,
-        html: buildDigestHtml(list)
+        subject,
+        html: makeHtml(list)
       });
+      sentToAssignees++;
     }
   }
 
+  let sentToInternal = 0;
   if (internalExtra.length) {
     await sendEmail({
       to: internalExtra,
-      subject: `Firm Daily Digest (${todayYmd})`,
-      html: buildDigestHtml(digestTasks)
+      subject: `Firm ${subject}`,
+      html: makeHtml(tasks)
     });
+    sentToInternal = internalExtra.length;
   }
 
   await settingsRef.set({ lastDailyRunYmd: todayYmd }, { merge: true });
@@ -150,7 +218,8 @@ exports.handler = withCors(async (event) => {
   return json(event, 200, {
     ok:true,
     todayYmd,
-    clientMailsSent,
-    digestCount: digestTasks.length
+    tasksCount: tasks.length,
+    sentToAssignees,
+    sentToInternal
   });
 });

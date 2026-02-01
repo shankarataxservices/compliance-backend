@@ -1,4 +1,10 @@
-const { withCors, json, db, admin, calendar, ymd, addDays, auditLog } = require('./_common');
+const {
+  withCors, json, db, admin,
+  calendar, ymdIST, dateFromYmdIST, addDays, addInterval,
+  getCalendarWindow, calTimeRange,
+  auditLog, asEmailList
+} = require('./_common');
+
 const { requireUser, requirePartner } = require('./_auth');
 
 async function findOrCreateClientByIdOrName({ clientId, clientName, clientEmail }) {
@@ -6,10 +12,7 @@ async function findOrCreateClientByIdOrName({ clientId, clientName, clientEmail 
     const cRef = db().collection('clients').doc(clientId);
     const cSnap = await cRef.get();
     if (!cSnap.exists) throw new Error('Client not found: ' + clientId);
-
-    if (clientEmail && !cSnap.data().primaryEmail) {
-      await cRef.update({ primaryEmail: clientEmail });
-    }
+    if (clientEmail && !cSnap.data().primaryEmail) await cRef.update({ primaryEmail: clientEmail });
     return clientId;
   }
 
@@ -42,6 +45,44 @@ async function findUserUidByEmail(email) {
   return snap.docs[0].id;
 }
 
+function normalizeRecurrence(x) {
+  const r = String(x || 'AD_HOC').toUpperCase().trim();
+  const allowed = ['AD_HOC','DAILY','WEEKLY','BIWEEKLY','MONTHLY','BIMONTHLY','QUARTERLY','HALF_YEARLY','YEARLY'];
+  return allowed.includes(r) ? r : 'AD_HOC';
+}
+
+function normalizeCategory(x) {
+  const raw = String(x || 'OTHER').trim();
+  const u = raw.toUpperCase().replace(/\s+/g, '_');
+  if (u === 'ITR' || u === 'INCOME_TAX' || u === 'INCOME-TAX') return 'INCOME_TAX';
+  if (u === 'GST') return 'GST';
+  if (u === 'TDS') return 'TDS';
+  if (u === 'ROC') return 'ROC';
+  if (u === 'ACCOUNTING') return 'ACCOUNTING';
+  if (u === 'AUDIT') return 'AUDIT';
+  return 'OTHER';
+}
+
+async function createStartCalendarEvent({ title, clientId, startDateYmd, dueDateYmd, window }) {
+  const cal = calendar();
+  const range = calTimeRange(startDateYmd, window.startHH, window.endHH, window.timeZone);
+
+  const res = await cal.events.insert({
+    calendarId: 'primary',
+    sendUpdates: 'none',
+    requestBody: {
+      summary: `START: ${title}`,
+      description:
+        `ClientId: ${clientId}\n` +
+        `Start: ${startDateYmd}\n` +
+        `Due: ${dueDateYmd}\n`,
+      ...range
+    }
+  });
+
+  return { calendarEventId: res.data.id, calendarHtmlLink: res.data.htmlLink || null };
+}
+
 exports.handler = withCors(async (event) => {
   if (event.httpMethod !== 'POST') return json(event, 405, { ok:false, error:'POST only' });
 
@@ -60,71 +101,126 @@ exports.handler = withCors(async (event) => {
     clientEmail: body.clientEmail || null,
   });
 
-  const dueDateYmd = body.dueDateYmd;
-  if (!dueDateYmd) return json(event, 400, { ok:false, error:'dueDateYmd required' });
+  const title = body.title || 'Untitled';
 
-  const triggerDaysBefore = Number(body.triggerDaysBefore ?? 15);
-  const startDateYmd = ymd(addDays(new Date(dueDateYmd), -triggerDaysBefore));
-  const endDateYmd = ymd(addDays(new Date(dueDateYmd), 1));
+  const dueDateYmd = String(body.dueDateYmd || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDateYmd)) {
+    return json(event, 400, { ok:false, error:'dueDateYmd required (YYYY-MM-DD)' });
+  }
 
-  const assignedToEmail = body.assignedToEmail || user.email;
+  const recurrence = normalizeRecurrence(body.recurrence || 'AD_HOC');
+  const generateCount = Math.max(1, parseInt(body.generateCount || '1', 10));
+  const triggerDaysBefore = Math.max(0, parseInt(body.triggerDaysBefore ?? 15, 10));
+
+  const assignedToEmail = (body.assignedToEmail || user.email || '').trim();
   const assignedToUid = (await findUserUidByEmail(assignedToEmail)) || user.uid;
 
-  const taskDoc = {
-    clientId,
-    title: body.title || 'Untitled',
-    category: (body.category || 'OTHER').toUpperCase(),
-    type: (body.type || 'FILING').toUpperCase(),
-    recurrence: 'AD_HOC',
+  const category = normalizeCategory(body.category || 'OTHER');
+  const type = String(body.type || 'FILING').trim(); // free text allowed
 
-    dueDateYmd,
-    startDateYmd,
-    triggerDaysBefore,
+  // Per-task mail controls (UI will expose later)
+  const clientToEmails = asEmailList(body.clientToEmails || body.clientTo || body.clientEmail || null);
+  const clientCcEmails = asEmailList(body.clientCcEmails || body.clientCc || null);
+  const clientBccEmails = asEmailList(body.clientBccEmails || body.clientBcc || null);
 
-    status: 'PENDING',
-    statusNote: '',
-    delayReason: null,
-    delayNotes: '',
+  const sendClientCompletionMail = body.sendClientCompletionMail !== false;
 
-    assignedToUid,
-    assignedToEmail,
+  const clientStartSubject = String(body.clientStartSubject || '').trim();
+  const clientStartBody = String(body.clientStartBody || '').trim();
 
-    // Client start mail
-    clientStartSubject: body.clientStartSubject || '',
-    clientStartBody: body.clientStartBody || '',
-    clientStartMailSent: false,
-    clientStartMailSentAt: null,
+  const clientCompletionSubject = String(body.clientCompletionSubject || '').trim();
+  const clientCompletionBody = String(body.clientCompletionBody || '').trim();
 
-    calendarEventId: null,
+  const isSeries = recurrence !== 'AD_HOC' && generateCount > 1;
+  const seriesId = isSeries ? db().collection('taskSeries').doc().id : null;
 
-    createdByUid: user.uid,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  const window = await getCalendarWindow();
 
-    completedRequestedAt: null,
-    completedAt: null,
+  let created = 0;
 
-    attachments: []
-  };
+  for (let i = 0; i < generateCount; i++) {
+    const dueDate = addInterval(dateFromYmdIST(dueDateYmd), recurrence, i);
+    const dueYmd = ymdIST(dueDate);
 
-  // Calendar event spanning start -> due+1
-  const created = await calendar().events.insert({
-    calendarId: 'primary',
-    sendUpdates: 'none',
-    requestBody: {
-      summary: `${taskDoc.title} (Due ${dueDateYmd})`,
-      start: { date: startDateYmd },
-      end: { date: endDateYmd },
-      description: `ClientId: ${clientId}\nStatus: ${taskDoc.status}\nStart: ${startDateYmd}\nDue: ${dueDateYmd}`
-    }
-  });
+    const startDate = addDays(dateFromYmdIST(dueYmd), -triggerDaysBefore);
+    const startYmd = ymdIST(startDate);
 
-  taskDoc.calendarEventId = created.data.id;
+    const ev = await createStartCalendarEvent({
+      title, clientId, startDateYmd: startYmd, dueDateYmd: dueYmd, window
+    });
 
-  const tRef = db().collection('tasks').doc();
-  await tRef.set(taskDoc);
+    const tRef = db().collection('tasks').doc();
+    await tRef.set({
+      clientId,
+      title,
+      category,
+      type,
+      recurrence,
 
-  await auditLog({ taskId: tRef.id, action:'TASK_CREATED', actorUid:user.uid, actorEmail:user.email, details:{ source:'UI_CREATE_ONE' } });
+      seriesId,
+      occurrenceIndex: i + 1,
+      occurrenceTotal: generateCount,
 
-  return json(event, 200, { ok:true, taskId: tRef.id });
+      dueDate: admin.firestore.Timestamp.fromDate(dateFromYmdIST(dueYmd)),
+      dueDateYmd: dueYmd,
+
+      triggerDaysBefore,
+      startDate: admin.firestore.Timestamp.fromDate(dateFromYmdIST(startYmd)),
+      startDateYmd: startYmd,
+
+      assignedToUid,
+      assignedToEmail,
+
+      status: 'PENDING',
+      statusNote: '',
+      delayReason: null,
+      delayNotes: '',
+
+      // NEW: single calendar event
+      calendarEventId: ev.calendarEventId,
+      calendarHtmlLink: ev.calendarHtmlLink || null,
+
+      // Back-compat fields (UI still shows start event id)
+      calendarStartEventId: ev.calendarEventId,
+      calendarDueEventId: null,
+
+      // Client mail templates + controls
+      clientToEmails,
+      clientCcEmails,
+      clientBccEmails,
+
+      clientStartSubject,
+      clientStartBody,
+      clientStartMailSent: false,
+      clientStartMailSentAt: null,
+      clientStartGmailThreadId: null,
+      clientStartGmailId: null,
+      clientStartRfcMessageId: null,
+
+      sendClientCompletionMail,
+      clientCompletionSubject,
+      clientCompletionBody,
+
+      createdByUid: user.uid,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+
+      completedRequestedAt: null,
+      completedAt: null,
+
+      attachments: []
+    });
+
+    await auditLog({
+      taskId: tRef.id,
+      action: 'TASK_CREATED',
+      actorUid: user.uid,
+      actorEmail: user.email,
+      details: { source:'UI_CREATE', seriesId, occurrenceIndex: i+1, startDateYmd: startYmd, dueDateYmd: dueYmd }
+    });
+
+    created++;
+  }
+
+  return json(event, 200, { ok:true, created, seriesId });
 });

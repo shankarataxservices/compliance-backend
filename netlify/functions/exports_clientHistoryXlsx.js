@@ -1,4 +1,4 @@
-const { withCors, json, db } = require('./_common');
+const { withCors, json, db, ymdToDmy } = require('./_common');
 const { requireUser, requirePartner } = require('./_auth');
 const ExcelJS = require('exceljs');
 
@@ -26,18 +26,20 @@ exports.handler = withCors(async (event) => {
     .get();
 
   const wb = new ExcelJS.Workbook();
-  const ws = wb.addWorksheet('History');
+  const ws = wb.addWorksheet('ClientHistory'); // FIX: not "History"
 
   ws.addRow([
     'Client',
     'Title',
     'Category',
     'Type',
-    'Start Date',
-    'Due Date',
+    'Recurrence',
+    'SeriesId',
+    'Occur',
+    'Start (DD-MM-YYYY)',
+    'Due (DD-MM-YYYY)',
     'Status',
-    'Status Note',
-    'Client Start Mail Sent'
+    'Status Note'
   ]);
 
   for (const tDoc of tasksSnap.docs) {
@@ -47,18 +49,20 @@ exports.handler = withCors(async (event) => {
       t.title,
       t.category,
       t.type,
-      t.startDateYmd,
-      t.dueDateYmd,
+      t.recurrence || '',
+      t.seriesId || '',
+      t.seriesId ? `${t.occurrenceIndex || ''}/${t.occurrenceTotal || ''}` : '',
+      ymdToDmy(t.startDateYmd),
+      ymdToDmy(t.dueDateYmd),
       t.status,
-      t.statusNote || '',
-      t.clientStartMailSent ? 'YES' : 'NO'
+      t.statusNote || ''
     ]);
   }
 
   const buf = await wb.xlsx.writeBuffer();
   return json(event, 200, {
     ok: true,
-    fileName: `${client.name}_history_${fromYmd}_to_${toYmd}.xlsx`,
+    fileName: `${client.name}_history_${ymdToDmy(fromYmd)}_to_${ymdToDmy(toYmd)}.xlsx`,
     base64: Buffer.from(buf).toString('base64')
   });
 });

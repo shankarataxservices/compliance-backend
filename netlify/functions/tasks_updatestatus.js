@@ -1,12 +1,50 @@
-const { withCors, json, db, admin, calendar, sendEmail, auditLog } = require('./_common');
+const {
+  withCors, json, db, admin,
+  calendar, getCalendarWindow, calTimeRange,
+  sendEmailReply, sendEmail,
+  auditLog, renderTemplate, ymdToDmy, uniqEmails
+} = require('./_common');
 const { requireUser } = require('./_auth');
 
-function renderTemplate(str, vars) {
-  return String(str || '')
-    .replaceAll('{{clientName}}', vars.clientName || '')
-    .replaceAll('{{taskTitle}}', vars.taskTitle || '')
-    .replaceAll('{{startDate}}', vars.startDate || '')
-    .replaceAll('{{dueDate}}', vars.dueDate || '');
+async function patchEvent({ eventId, whenYmd, summary, description, colorId=null, window }) {
+  if (!eventId) return;
+  const cal = calendar();
+  const range = calTimeRange(whenYmd, window.startHH, window.endHH, window.timeZone);
+
+  await cal.events.patch({
+    calendarId: 'primary',
+    eventId,
+    sendUpdates: 'none',
+    requestBody: {
+      summary,
+      description,
+      ...range,
+      ...(colorId ? { colorId } : {})
+    }
+  });
+}
+
+function mergeRecipients({ client, task }) {
+  // To: task overrides, else client.primaryEmail
+  const to = (task.clientToEmails && task.clientToEmails.length)
+    ? task.clientToEmails
+    : (client.primaryEmail ? [client.primaryEmail] : []);
+
+  // CC/BCC: client defaults + task overrides
+  const cc = [
+    ...(client.ccEmails || []),
+    ...(task.clientCcEmails || []),
+  ];
+  const bcc = [
+    ...(client.bccEmails || []),
+    ...(task.clientBccEmails || []),
+  ];
+
+  return {
+    to: uniqEmails(to),
+    cc: uniqEmails(cc),
+    bcc: uniqEmails(bcc),
+  };
 }
 
 exports.handler = withCors(async (event) => {
@@ -55,43 +93,111 @@ exports.handler = withCors(async (event) => {
     details: { from: task.status, to: newStatus, statusNote: statusNote || '' }
   });
 
-  // Only on COMPLETED: email client
+  // ===== On COMPLETED =====
   if (newStatus === 'COMPLETED') {
-    // Patch calendar (no guest mails)
-    if (task.calendarEventId) {
-      try {
-        await calendar().events.patch({
-          calendarId: 'primary',
-          eventId: task.calendarEventId,
-          sendUpdates: 'none',
-          requestBody: { summary: `[COMPLETED] ${task.title} (Due ${task.dueDateYmd})`, colorId: '2' }
+    const window = await getCalendarWindow();
+
+    const desc =
+      `ClientId: ${task.clientId}\n` +
+      `Start: ${task.startDateYmd}\n` +
+      `Due: ${task.dueDateYmd}\n` +
+      `TaskId: ${taskId}`;
+
+    // Patch calendar event (single event). Also patch old fields if task was created earlier.
+    const eventId = task.calendarEventId || task.calendarStartEventId || null;
+    try {
+      if (eventId) {
+        await patchEvent({
+          eventId,
+          whenYmd: task.startDateYmd,
+          summary: `[COMPLETED] START: ${task.title}`,
+          description: desc,
+          colorId: '2',
+          window
         });
-      } catch (e) {}
+      }
+      // Backward compatibility: if old due event exists, patch it too.
+      if (task.calendarDueEventId) {
+        await patchEvent({
+          eventId: task.calendarDueEventId,
+          whenYmd: task.dueDateYmd,
+          summary: `[COMPLETED] DUE: ${task.title}`,
+          description: desc,
+          colorId: '2',
+          window
+        });
+      }
+    } catch (e) {
+      console.warn('Calendar patch failed (ignored):', e.message || e);
     }
 
+    // Respect per-task flag
+    if (task.sendClientCompletionMail === false) {
+      return json(event, 200, { ok:true, note:'Completed. Client completion mail disabled for this task.' });
+    }
+
+    // Load client
     const cSnap = await db().collection('clients').doc(task.clientId).get();
     const client = cSnap.exists ? cSnap.data() : {};
-    const to = client.primaryEmail ? [client.primaryEmail] : [];
-    const cc = client.ccEmails || [];
-    const bcc = client.bccEmails || [];
 
-    if (to.length) {
-      const html = `
-        <p>Dear ${client.name || 'Client'},</p>
-        <p>We have completed: <b>${task.title}</b></p>
-        <p>Due date: <b>${task.dueDateYmd}</b></p>
-        <p>Status note: ${updates.statusNote || task.statusNote || ''}</p>
-        <p>Regards,<br>${process.env.MAIL_SIGNATURE || 'Compliance Team'}</p>
-      `;
+    const { to, cc, bcc } = mergeRecipients({ client, task });
+    if (!to.length) {
+      return json(event, 200, { ok:true, note:'Completed. No client email found to send completion mail.' });
+    }
 
-      await sendEmail({
+    const completedAtText = `${ymdToDmy(task.dueDateYmd)} (completed at: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })})`;
+
+    const vars = {
+      clientName: client.name || '',
+      taskTitle: task.title || '',
+      startDate: ymdToDmy(task.startDateYmd),
+      dueDate: ymdToDmy(task.dueDateYmd),
+      completedAt: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+      statusNote: (typeof updates.statusNote === 'string' ? updates.statusNote : (task.statusNote || '')),
+    };
+
+    const subject = renderTemplate(
+      task.clientCompletionSubject || `Completed: {{taskTitle}}`,
+      vars
+    );
+
+    const html = renderTemplate(
+      task.clientCompletionBody || (
+        `Dear {{clientName}},\n\n` +
+        `We have completed: {{taskTitle}}\n` +
+        `Due date: {{dueDate}}\n` +
+        `Completed at: {{completedAt}}\n` +
+        `Status note: {{statusNote}}\n\n` +
+        `Regards,\n${process.env.MAIL_SIGNATURE || 'Compliance Team'}`
+      ),
+      vars
+    );
+
+    // Reply in same thread if we have it
+    const threadId = task.clientStartGmailThreadId || null;
+    const inReplyTo = task.clientStartRfcMessageId || null;
+
+    if (threadId) {
+      await sendEmailReply({
+        threadId,
+        inReplyTo,
+        references: inReplyTo,
         to, cc, bcc,
-        subject: `Completed: ${task.title} (${client.name || ''})`,
+        subject,
         html
       });
-
-      await auditLog({ taskId, action:'EMAIL_SENT', actorUid:null, actorEmail:null, details:{ type:'CLIENT_COMPLETION' } });
+    } else {
+      // fallback: send as new mail
+      await sendEmail({ to, cc, bcc, subject, html });
     }
+
+    await auditLog({
+      taskId,
+      action: 'EMAIL_SENT',
+      actorUid: null,
+      actorEmail: null,
+      details: { type:'CLIENT_COMPLETION', repliedToStartThread: !!threadId }
+    });
   }
 
   return json(event, 200, { ok:true });
