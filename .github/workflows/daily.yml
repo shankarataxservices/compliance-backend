@@ -1,0 +1,28 @@
+name: Daily Digest 05:00 IST
+on:
+  schedule:
+    - cron: "30 23 * * *"  # 23:30 UTC = 05:00 IST (next day)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force run (ignore last run date)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger internal daily digest job
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          JSON=$(jq -n --arg f "${FORCE:-false}" '{force: ($f=="true")}')
+          curl -sS --fail-with-body --retry 3 --retry-delay 10 \
+            -X POST "https://investigators-burlington-button-harvest.trycloudflare.com/.netlify/functions/jobs_daily5am" \
+            -H "x-cron-secret: ${CRON_SECRET}" \
+            -H "Content-Type: application/json" \
+            --data "$JSON"

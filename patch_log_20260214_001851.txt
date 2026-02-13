@@ -1,0 +1,134 @@
+
+[═══] ════════════════════════════════════════════════════════════
+[═══]   TASK MANAGEMENT APP — PENDING CHANGES PATCHER
+[═══] ════════════════════════════════════════════════════════════
+[INFO ] Started at: 2026-02-14 00:18:47
+
+[STEP ] Opening folder picker...
+[INFO ] Selected folder: /home/ubuntu/cm-oauth-setup/compliance-backend
+
+[STEP ] Validating folder structure...
+[    >]   index.html: NOT FOUND
+[    >]   netlify/functions/tasks_updatestatus.js: FOUND
+[    >]   netlify/functions/series_rebuild.js: FOUND
+[    >]   netlify/functions/tasks_bulkimportcsv.js: FOUND
+[    >]   netlify/functions/tasks_createone.js: FOUND
+[FAIL ] index.html not found in selected folder!
+
+
+[═══] ════════════════════════════════════════════════════════════
+[═══]   PHASE 1: UI PATCHES (index.html)
+[═══] ════════════════════════════════════════════════════════════
+[    >] Reading: /home/ubuntu/cm-oauth-setup/compliance-backend/index.html
+[FAIL ] File NOT FOUND: /home/ubuntu/cm-oauth-setup/compliance-backend/index.html
+[FAIL ] Cannot read index.html. Aborting UI patches.
+
+[═══] ════════════════════════════════════════════════════════════
+[═══]   PHASE 2: BACKEND PATCHES
+[═══] ════════════════════════════════════════════════════════════
+
+
+[═══] ════════════════════════════════════════════════════════════
+[═══]   File: netlify/functions/tasks_updatestatus.js
+[═══] ════════════════════════════════════════════════════════════
+[    >] Reading: /home/ubuntu/cm-oauth-setup/compliance-backend/netlify/functions/tasks_updatestatus.js
+[    >] Read 6423 chars, 202 lines
+[STEP ] Creating backup of netlify/functions/tasks_updatestatus.js...
+[    >] Backup created: /home/ubuntu/cm-oauth-setup/compliance-backend/netlify/functions/tasks_updatestatus.js.20260214_001851.bak
+[STEP ] Patch: BE-1: Calendar completion patch Client NAME
+[    >]   Exact match failed, trying line-stripped matching...
+[    >]   Line-stripped match found at lines 85-88
+[ OK  ]   Applied via line-stripped match: BE-1: Calendar completion patch Client NAME
+
+[    >] Written 6636 chars to /home/ubuntu/cm-oauth-setup/compliance-backend/netlify/functions/tasks_updatestatus.js
+[ OK  ] netlify/functions/tasks_updatestatus.js written with all applied patches
+
+
+[═══] ════════════════════════════════════════════════════════════
+[═══]   File: netlify/functions/series_rebuild.js
+[═══] ════════════════════════════════════════════════════════════
+[    >] Reading: /home/ubuntu/cm-oauth-setup/compliance-backend/netlify/functions/series_rebuild.js
+[    >] Read 5029 chars, 152 lines
+[STEP ] Creating backup of netlify/functions/series_rebuild.js...
+[    >] Backup created: /home/ubuntu/cm-oauth-setup/compliance-backend/netlify/functions/series_rebuild.js.20260214_001851.bak
+[STEP ] Patch: BE-2A: series_rebuild imports update
+[SKIP ]   Already applied: BE-2A: series_rebuild imports update
+
+[STEP ] Patch: BE-2B: Remove local createStartCalendarEvent from series_rebuild
+[    >]   Exact match failed, trying line-stripped matching...
+[    >]   Line-stripped match found at lines 20-33
+[ OK  ]   Applied via line-stripped match: BE-2B: Remove local createStartCalendarEvent from series_rebuild
+
+[STEP ] Patch: BE-2C: Load clientName in series_rebuild
+[    >]   Exact match at position 1592
+[ OK  ]   Applied via exact match: BE-2C: Load clientName in series_rebuild
+
+[STEP ] Patch: BE-2D: series_rebuild calendar event creation call
+[    >]   Exact match failed, trying line-stripped matching...
+[    >]   Line-stripped match found at lines 87-93
+[ OK  ]   Applied via line-stripped match: BE-2D: series_rebuild calendar event creation call
+
+[STEP ] Patch: BE-2E: series_rebuild store clientNameSnapshot
+[    >]   Exact match failed, trying line-stripped matching...
+[    >]   Line-stripped match found at lines 98-101
+[ OK  ]   Applied via line-stripped match: BE-2E: series_rebuild store clientNameSnapshot
+
+[    >] Written 5140 chars to /home/ubuntu/cm-oauth-setup/compliance-backend/netlify/functions/series_rebuild.js
+[ OK  ] netlify/functions/series_rebuild.js written with all applied patches
+
+
+[═══] ════════════════════════════════════════════════════════════
+[═══]   File: netlify/functions/tasks_bulkimportcsv.js
+[═══] ════════════════════════════════════════════════════════════
+[    >] Reading: /home/ubuntu/cm-oauth-setup/compliance-backend/netlify/functions/tasks_bulkimportcsv.js
+[    >] Read 9802 chars, 275 lines
+[STEP ] Creating backup of netlify/functions/tasks_bulkimportcsv.js...
+[    >] Backup created: /home/ubuntu/cm-oauth-setup/compliance-backend/netlify/functions/tasks_bulkimportcsv.js.20260214_001851.bak
+[STEP ] Patch: BE-3A: bulkimport imports update
+[SKIP ]   Already applied: BE-3A: bulkimport imports update
+
+[STEP ] Patch: BE-3B: Remove local createStartCalendarEvent from bulkimport
+[    >]   Exact match failed, trying line-stripped matching...
+[    >]   Line-stripped match found at lines 81-97
+[ OK  ]   Applied via line-stripped match: BE-3B: Remove local createStartCalendarEvent from bulkimport
+
+[STEP ] Patch: BE-3C: bulkimport pass clientName to calendar
+[    >]   Exact match failed, trying line-stripped matching...
+[    >]   Line-stripped match found at lines 175-177
+[ OK  ]   Applied via line-stripped match: BE-3C: bulkimport pass clientName to calendar
+
+[    >] Written 9642 chars to /home/ubuntu/cm-oauth-setup/compliance-backend/netlify/functions/tasks_bulkimportcsv.js
+[ OK  ] netlify/functions/tasks_bulkimportcsv.js written with all applied patches
+
+
+[═══] ════════════════════════════════════════════════════════════
+[═══]   File: netlify/functions/tasks_createone.js
+[═══] ════════════════════════════════════════════════════════════
+[    >] Reading: /home/ubuntu/cm-oauth-setup/compliance-backend/netlify/functions/tasks_createone.js
+[    >] Read 9878 chars, 270 lines
+[STEP ] Creating backup of netlify/functions/tasks_createone.js...
+[    >] Backup created: /home/ubuntu/cm-oauth-setup/compliance-backend/netlify/functions/tasks_createone.js.20260214_001851.bak
+[STEP ] Patch: BE-4A: createone define calendarDescription
+[    >]   Exact match at position 6018
+[ OK  ]   Applied via exact match: BE-4A: createone define calendarDescription
+
+[STEP ] Patch: BE-4B: createone pass clientName to calendar
+[SKIP ]   Already applied: BE-4B: createone pass clientName to calendar
+
+[STEP ] Patch: BE-4C: createone store clientNameSnapshot
+[    >]   Exact match failed, trying line-stripped matching...
+[    >]   Line-stripped match found at lines 188-193
+[ OK  ]   Applied via line-stripped match: BE-4C: createone store clientNameSnapshot
+
+[    >] Written 10113 chars to /home/ubuntu/cm-oauth-setup/compliance-backend/netlify/functions/tasks_createone.js
+[ OK  ] netlify/functions/tasks_createone.js written with all applied patches
+
+
+[═══] ════════════════════════════════════════════════════════════
+[═══]   FINAL SUMMARY
+[═══] ════════════════════════════════════════════════════════════
+[INFO ] Successful replacements : 13
+[INFO ] Skipped (already done?) : 3
+[INFO ] Warnings                : 0
+[INFO ] Failures                : 3
+[FAIL ] SOME PATCHES FAILED — review log above!

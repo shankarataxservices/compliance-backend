@@ -1,0 +1,28 @@
+name: Client Start Mails 08:15 IST
+on:
+  schedule:
+    - cron: "45 2 * * *"  # 02:45 UTC = 08:15 IST
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force run (ignore last run date)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger client start mail job
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          JSON=$(jq -n --arg f "${FORCE:-false}" '{force: ($f=="true")}')
+          curl -sS --fail-with-body --retry 3 --retry-delay 10 \
+            -X POST "https://investigators-burlington-button-harvest.trycloudflare.com/.netlify/functions/jobs_client0815" \
+            -H "x-cron-secret: ${CRON_SECRET}" \
+            -H "Content-Type: application/json" \
+            --data "$JSON"

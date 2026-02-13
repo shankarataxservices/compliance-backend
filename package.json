@@ -1,0 +1,20 @@
+{
+  "name": "compliance-backend",
+  "version": "1.0.0",
+  "dependencies": {
+    "busboy": "^1.6.0",
+    "csv-parse": "^5.5.6",
+    "dotenv": "^17.2.4",
+    "exceljs": "^4.4.0",
+    "express": "^5.2.1",
+    "firebase-admin": "^12.7.0",
+    "googleapis": "^134.0.0",
+    "pdfkit": "^0.17.2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.27.2"
+  },
+  "scripts": {
+    "build": "esbuild netlify/functions/*.js --bundle --outdir=build --platform=node"
+  }
+}

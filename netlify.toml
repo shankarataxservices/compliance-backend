@@ -1,0 +1,15 @@
+[build]
+  # Folder that contains your Netlify functions
+  functions = "netlify/functions"
+  # Folder where the build output is stored (e.g., dist or build)
+  publish = "build"  # or "dist" depending on your build folder name
+
+[functions]
+  node_bundler = "esbuild"  # Use esbuild for faster bundling of your functions
+  external_node_modules = ["express", "serverless-http"]  # If you're using external packages in your functions
+
+[[redirects]]
+  # Redirect API calls to serverless functions
+  from = "/api/*"
+  to = "/.netlify/functions/:splat"
+  status = 200

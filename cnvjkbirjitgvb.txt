@@ -1,0 +1,1203 @@
+--- Contents of: /home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions ---
+
+    =� _auth.js
+
+       --- File Content Start ---
+
+const { auth, db, json } = require('./_common');
+
+async function requireUser(event) {
+  const h = event.headers.authorization || event.headers.Authorization || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : null;
+  if (!token) return { error: json(event, 401, { ok:false, error: 'Missing Bearer token' }) };
+
+  const decoded = await auth().verifyIdToken(token);
+  const uSnap = await db().collection('users').doc(decoded.uid).get();
+  const u = uSnap.exists ? uSnap.data() : null;
+
+  return { user: { uid: decoded.uid, email: decoded.email, role: u?.role || 'WORKER' } };
+}
+
+function requirePartner(event, user) {
+  if (user.role !== 'PARTNER') return { error: json(event, 403, { ok:false, error:'Partner only' }) };
+  return { ok:true };
+}
+
+function requireCron(event) {
+  const s = event.headers['x-cron-secret'] || event.headers['X-Cron-Secret'];
+  if (!s || s !== process.env.CRON_SECRET) return { error: json(event, 401, { ok:false, error:'Bad cron secret' }) };
+  return { ok:true };
+}
+
+module.exports = { requireUser, requirePartner, requireCron };
+
+       --- File Content End ---
+
+
+    =� _common.js
+
+       --- File Content Start ---
+
+const admin = require('firebase-admin');
+const { google } = require('googleapis');
+const { Readable } = require('stream');
+
+let inited = false;
+
+function init() {
+  if (inited) return;
+  const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  admin.initializeApp({ credential: admin.credential.cert(sa) });
+  inited = true;
+}
+
+function db() { init(); return admin.firestore(); }
+function auth() { init(); return admin.auth(); }
+
+function oauthClient() {
+  const o = new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
+  o.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+  return o;
+}
+
+function calendar() { return google.calendar({ version: 'v3', auth: oauthClient() }); }
+function gmail() { return google.gmail({ version: 'v1', auth: oauthClient() }); }
+function drive() { return google.drive({ version: 'v3', auth: oauthClient() }); }
+
+/** CORS helpers */
+function corsHeaders(event) {
+  const origin = event?.headers?.origin || event?.headers?.Origin || '*';
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Vary': 'Origin',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-cron-secret',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Max-Age': '86400',
+  };
+}
+
+function json(event, statusCode, body) {
+  return {
+    statusCode,
+    headers: { ...corsHeaders(event), 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  };
+}
+
+/** Wrap every function with: OPTIONS + try/catch + always CORS */
+function withCors(handler) {
+  return async (event, context) => {
+    if (event.httpMethod === 'OPTIONS') {
+      return { statusCode: 204, headers: corsHeaders(event), body: '' };
+    }
+    try {
+      const res = await handler(event, context);
+
+      // Ensure CORS headers exist even if handler returned a raw object
+      res.headers = { ...corsHeaders(event), ...(res.headers || {}) };
+      return res;
+    } catch (e) {
+      console.error('Function crashed:', e);
+      return json(event, 500, { ok: false, error: e.message || String(e) });
+    }
+  };
+}
+
+function ymd(d) {
+  const x = new Date(d);
+  x.setHours(0,0,0,0);
+  const yyyy = x.getFullYear();
+  const mm = String(x.getMonth()+1).padStart(2,'0');
+  const dd = String(x.getDate()).padStart(2,'0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function addDays(date, days) {
+  const d = new Date(date);
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
+async function auditLog({ taskId, action, actorUid, actorEmail, details }) {
+  await db().collection('auditLogs').add({
+    taskId: taskId || null,
+    action,
+    actorUid: actorUid || null,
+    actorEmail: actorEmail || null,
+    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+    details: details || {}
+  });
+}
+
+function buildRawEmail({ from, to, cc = [], bcc = [], subject, html }) {
+  const msg = [
+    `From: ${from}`,
+    `To: ${to.join(', ')}`,
+    cc.length ? `Cc: ${cc.join(', ')}` : '',
+    bcc.length ? `Bcc: ${bcc.join(', ')}` : '',
+    'MIME-Version: 1.0',
+    'Content-Type: text/html; charset="UTF-8"',
+    `Subject: ${subject}`,
+    '',
+    html
+  ].filter(Boolean).join('\n');
+
+  return Buffer.from(msg).toString('base64').replace(/\+/g,'-').replace(/\//g,'_');
+}
+
+async function sendEmail({ to, cc = [], bcc = [], subject, html }) {
+  if (!to?.length) return;
+  const g = gmail();
+  const raw = buildRawEmail({
+    from: process.env.BOT_FROM,
+    to, cc, bcc, subject, html,
+  });
+  await g.users.messages.send({ userId: 'me', requestBody: { raw } });
+}
+
+async function driveUpload({ folderId, filename, mimeType, buffer }) {
+  const d = drive();
+  const res = await d.files.create({
+    requestBody: { name: filename, parents: [folderId] },
+    media: { mimeType, body: Readable.from(buffer) },
+    fields: 'id, webViewLink, size, mimeType, name'
+  });
+  return res.data;
+}
+
+module.exports = {
+  admin, db, auth, calendar, gmail, drive,
+  withCors, json,
+  ymd, addDays,
+  auditLog, sendEmail,
+  driveUpload
+};
+
+       --- File Content End ---
+
+
+    =� clients_create.js
+
+       --- File Content Start ---
+
+const { json, db, admin, auditLog } = require('./_common');
+const { requireUser, requirePartner } = require('./_auth');
+
+exports.handler = async (event) => {
+  if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers: require('./_common').cors() };
+  if (event.httpMethod !== 'POST') return json(405, { error: 'POST only' });
+
+  const authRes = await requireUser(event);
+  if (authRes.error) return authRes.error;
+  const { user } = authRes;
+
+  const p = requirePartner(user);
+  if (p.error) return p.error;
+
+  const body = JSON.parse(event.body || '{}');
+
+  const ref = db().collection('clients').doc();
+  await ref.set({
+    name: body.name || '',
+    pan: body.pan || '',
+    gstin: body.gstin || '',
+    cin: body.cin || '',
+    assessmentYear: body.assessmentYear || '',
+    engagementType: body.engagementType || '',
+    primaryEmail: body.primaryEmail || '',
+    ccEmails: body.ccEmails || [],
+    bccEmails: body.bccEmails || [],
+    driveFolderId: null,
+    createdAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+
+  await auditLog({ action: 'CLIENT_CREATED', actorUid: user.uid, actorEmail: user.email, details: { clientId: ref.id } });
+  return json(200, { ok: true, clientId: ref.id });
+};
+
+
+       --- File Content End ---
+
+
+    =� exports_clientHistoryXlsx.js
+
+       --- File Content Start ---
+
+const { json, db } = require('./_common');
+const { requireUser, requirePartner } = require('./_auth');
+const ExcelJS = require('exceljs');
+
+exports.handler = async (event) => {
+  if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers: require('./_common').cors() };
+  if (event.httpMethod !== 'POST') return json(405, { error: 'POST only' });
+
+  const authRes = await requireUser(event);
+  if (authRes.error) return authRes.error;
+  const { user } = authRes;
+  const p = requirePartner(user);
+  if (p.error) return p.error;
+
+  const { clientId, fromYmd, toYmd } = JSON.parse(event.body || '{}');
+  if (!clientId || !fromYmd || !toYmd) return json(400, { error: 'clientId,fromYmd,toYmd required' });
+
+  const clientSnap = await db().collection('clients').doc(clientId).get();
+  if (!clientSnap.exists) return json(404, { error: 'Client not found' });
+  const client = clientSnap.data();
+
+  const tasksSnap = await db().collection('tasks')
+    .where('clientId', '==', clientId)
+    .where('dueDateYmd', '>=', fromYmd)
+    .where('dueDateYmd', '<=', toYmd)
+    .get();
+
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('History');
+  ws.addRow(['Client', 'Title', 'Category', 'Type', 'Due Date', 'Start Date', 'Status', 'DelayReason']);
+
+  for (const tDoc of tasksSnap.docs) {
+    const t = tDoc.data();
+    ws.addRow([
+      client.name,
+      t.title,
+      t.category,
+      t.type,
+      t.dueDateYmd,
+      t.startDateYmd,
+      t.status,
+      t.delayReason || ''
+    ]);
+  }
+
+  const buf = await wb.xlsx.writeBuffer();
+  return {
+    statusCode: 200,
+    headers: {
+      ...require('./_common').cors(),
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      ok: true,
+      fileName: `${client.name}_history_${fromYmd}_to_${toYmd}.xlsx`,
+      base64: Buffer.from(buf).toString('base64')
+    })
+  };
+};
+
+
+       --- File Content End ---
+
+
+    =� jobs_daily.js
+
+       --- File Content Start ---
+
+const { json, db, sendEmail, auditLog, ymd, addDays } = require('./_common');
+const { requireCron } = require('./_auth');
+
+exports.handler = async (event) => {
+  if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers: require('./_common').cors() };
+  if (event.httpMethod !== 'POST') return json(405, { error: 'POST only' });
+
+  const cron = requireCron(event);
+  if (cron.error) return cron.error;
+
+  const today = new Date();
+  const todayYmd = ymd(today);
+
+  const tasksSnap = await db().collection('tasks')
+    .where('status', 'in', ['PENDING', 'IN_PROGRESS', 'CLIENT_PENDING', 'APPROVAL_PENDING'])
+    .get();
+
+  for (const doc of tasksSnap.docs) {
+    const t = doc.data();
+
+    const clientSnap = await db().collection('clients').doc(t.clientId).get();
+    const client = clientSnap.exists ? clientSnap.data() : {};
+    const to = client.primaryEmail ? [client.primaryEmail] : [];
+    const cc = client.ccEmails || [];
+    const bcc = client.bccEmails || [];
+
+    if (!to.length) continue;
+
+    // Start notification (startDate)
+    if (t.startDateYmd === todayYmd && !t.escalation?.startSent) {
+      await sendEmail({
+        to, cc, bcc,
+        subject: `Task started: ${t.title} (${client.name || ''})`,
+        html: `<p>Task started: <b>${t.title}</b></p><p>Due: ${t.dueDateYmd}</p>`
+      });
+      await doc.ref.update({ 'escalation.startSent': true });
+      await auditLog({ taskId: doc.id, action: 'EMAIL_SENT', actorUid: null, actorEmail: null, details: { type: 'START' } });
+    }
+
+    // Escalations by due date
+    const d7 = ymd(addDays(new Date(t.dueDateYmd), -7));
+    const d3 = ymd(addDays(new Date(t.dueDateYmd), -3));
+
+    if (todayYmd === d7 && !t.escalation?.d7) {
+      await sendEmail({ to, cc, bcc, subject: `Escalation: 7 days left - ${t.title}`, html: `<p>Due in 7 days: <b>${t.title}</b> (${t.dueDateYmd})</p>` });
+      await doc.ref.update({ 'escalation.d7': true });
+    }
+    if (todayYmd === d3 && !t.escalation?.d3) {
+      await sendEmail({ to, cc, bcc, subject: `Escalation: 3 days left - ${t.title}`, html: `<p>Due in 3 days: <b>${t.title}</b> (${t.dueDateYmd})</p>` });
+      await doc.ref.update({ 'escalation.d3': true });
+    }
+    if (todayYmd === t.dueDateYmd && !t.escalation?.d0) {
+      await sendEmail({ to, cc, bcc, subject: `Due today: ${t.title}`, html: `<p>Due today: <b>${t.title}</b></p>` });
+      await doc.ref.update({ 'escalation.d0': true });
+    }
+    if (todayYmd > t.dueDateYmd && !t.escalation?.overdue) {
+      await sendEmail({ to, cc, bcc, subject: `Overdue: ${t.title}`, html: `<p>Overdue: <b>${t.title}</b> (was due ${t.dueDateYmd})</p>` });
+      await doc.ref.update({ 'escalation.overdue': true });
+    }
+  }
+
+  return json(200, { ok: true, date: todayYmd });
+};
+
+
+       --- File Content End ---
+
+
+    =� jobs_daily5am.js
+
+       --- File Content Start ---
+
+const { withCors, json, db, ymd, addDays, sendEmail, auditLog, admin } = require('./_common');
+const { requireCron } = require('./_auth');
+
+function uniq(arr) { return [...new Set((arr||[]).map(x=>String(x).trim()).filter(Boolean))]; }
+
+function buildDigestHtml({ title, tasks }) {
+  const lines = tasks.map(t => `<li><b>${t.title}</b> — Due ${t.dueDateYmd} — ${t.status}</li>`).join('');
+  return `<p>${title}</p><ul>${lines || '<li>None</li>'}</ul>`;
+}
+
+exports.handler = withCors(async (event) => {
+  const cron = requireCron(event);
+  if (cron.error) return cron.error;
+
+  const body = event.body ? JSON.parse(event.body) : {};
+  const force = !!body.force;
+
+  const todayYmd = ymd(new Date());
+
+  const settingsRef = db().collection('settings').doc('notifications');
+  const settingsSnap = await settingsRef.get();
+  const settings = settingsSnap.exists ? settingsSnap.data() : {
+    dailyInternalEmails: [],
+    dailyWindowDays: 30,
+    sendDailyToAssignees: true,
+    clientReminderDays: 15
+  };
+
+  if (!force && settings.lastDailyRunYmd === todayYmd) {
+    return json(event, 200, { ok:true, skipped:true, reason:'Already ran today' });
+  }
+
+  const windowDays = Number(settings.dailyWindowDays || 30);
+  const clientReminderDays = Number(settings.clientReminderDays || 15);
+
+  const endYmd = ymd(addDays(new Date(), windowDays));
+  const reminderTargetYmd = ymd(addDays(new Date(), clientReminderDays));
+
+  // Pull tasks for digest: overdue + due within window, excluding COMPLETED
+  // Because Firestore doesn't support OR nicely, we do 2 queries.
+  const activeStatuses = ['PENDING','IN_PROGRESS','CLIENT_PENDING','APPROVAL_PENDING'];
+
+  const dueSoonSnap = await db().collection('tasks')
+    .where('status', 'in', activeStatuses)
+    .where('dueDateYmd', '>=', todayYmd)
+    .where('dueDateYmd', '<=', endYmd)
+    .get();
+
+  const overdueSnap = await db().collection('tasks')
+    .where('status', 'in', activeStatuses)
+    .where('dueDateYmd', '<', todayYmd)
+    .get();
+
+  const tasks = [
+    ...dueSoonSnap.docs.map(d => ({ id:d.id, ...d.data() })),
+    ...overdueSnap.docs.map(d => ({ id:d.id, ...d.data() })),
+  ];
+
+  // Group by assignee for worker daily digest
+  const byAssignee = new Map();
+  for (const t of tasks) {
+    const key = t.assignedToEmail || '';
+    if (!key) continue;
+    if (!byAssignee.has(key)) byAssignee.set(key, []);
+    byAssignee.get(key).push(t);
+  }
+
+  // Internal recipients list (from settings)
+  const internalExtra = uniq(settings.dailyInternalEmails || []);
+
+  // 1) Send worker digests (internal daily)
+  if (settings.sendDailyToAssignees !== false) {
+    for (const [email, list] of byAssignee.entries()) {
+      await sendEmail({
+        to: [email],
+        subject: `Daily Task Digest (${todayYmd})`,
+        html: buildDigestHtml({ title: 'Tasks requiring action:', tasks: list })
+      });
+    }
+  }
+
+  // 2) Send partner/admin digest to internalExtra emails
+  if (internalExtra.length) {
+    await sendEmail({
+      to: internalExtra,
+      subject: `Firm Daily Digest (${todayYmd})`,
+      html: buildDigestHtml({ title: 'All tasks requiring action (firm):', tasks })
+    });
+  }
+
+  // 3) Client reminder ONLY at D-15 (not daily)
+  // Send only for tasks due on reminderTargetYmd and not already sent.
+  const clientReminderSnap = await db().collection('tasks')
+    .where('status', 'in', activeStatuses)
+    .where('dueDateYmd', '==', reminderTargetYmd)
+    .where('clientReminderSent', '==', false)
+    .get();
+
+  for (const doc of clientReminderSnap.docs) {
+    const t = doc.data();
+    const cSnap = await db().collection('clients').doc(t.clientId).get();
+    const client = cSnap.exists ? cSnap.data() : {};
+    if (!client.primaryEmail) continue;
+
+    await sendEmail({
+      to: [client.primaryEmail],
+      subject: `Reminder: ${t.title} due on ${t.dueDateYmd}`,
+      html: `
+        <p>Dear ${client.name || 'Client'},</p>
+        <p>This is a reminder that <b>${t.title}</b> is due on <b>${t.dueDateYmd}</b>.</p>
+        <p>Please share required documents at the earliest.</p>
+      `
+    });
+
+    await doc.ref.update({
+      clientReminderSent: true,
+      clientReminderSentAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    await auditLog({ taskId: doc.id, action:'EMAIL_SENT', actorUid:null, actorEmail:null, details:{ type:'CLIENT_D15_REMINDER' } });
+  }
+
+  // mark last run
+  await settingsRef.set({ lastDailyRunYmd: todayYmd }, { merge: true });
+
+  return json(event, 200, {
+    ok:true,
+    todayYmd,
+    digestTasks: tasks.length,
+    clientReminderCount: clientReminderSnap.size
+  });
+});
+
+       --- File Content End ---
+
+
+    =� jobs_monthlysummary.js
+
+       --- File Content Start ---
+
+const { json, db, sendEmail } = require('./_common');
+const { requireCron } = require('./_auth');
+
+exports.handler = async (event) => {
+  if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers: require('./_common').cors() };
+  if (event.httpMethod !== 'POST') return json(405, { error: 'POST only' });
+
+  const cron = requireCron(event);
+  if (cron.error) return cron.error;
+
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth(); // current
+  const lastMonthStart = new Date(year, month - 1, 1);
+  const lastMonthEnd = new Date(year, month, 0);
+
+  const startYmd = `${lastMonthStart.getFullYear()}-${String(lastMonthStart.getMonth()+1).padStart(2,'0')}-01`;
+  const endYmd = `${lastMonthEnd.getFullYear()}-${String(lastMonthEnd.getMonth()+1).padStart(2,'0')}-${String(lastMonthEnd.getDate()).padStart(2,'0')}`;
+
+  const clientsSnap = await db().collection('clients').get();
+
+  for (const cDoc of clientsSnap.docs) {
+    const client = cDoc.data();
+    if (!client.primaryEmail) continue;
+
+    const tasksSnap = await db().collection('tasks')
+      .where('clientId', '==', cDoc.id)
+      .where('dueDateYmd', '>=', startYmd)
+      .where('dueDateYmd', '<=', endYmd)
+      .get();
+
+    const completed = [];
+    const pending = [];
+
+    for (const tDoc of tasksSnap.docs) {
+      const t = tDoc.data();
+      if (t.status === 'COMPLETED') completed.push(t);
+      else pending.push(t);
+    }
+
+    const html = `
+      <p>Monthly Compliance Summary for <b>${client.name}</b></p>
+      <p>Period: ${startYmd} to ${endYmd}</p>
+      <h3>Completed</h3>
+      <ul>${completed.map(x => `<li>${x.title} (Due ${x.dueDateYmd})</li>`).join('') || '<li>None</li>'}</ul>
+      <h3>Pending / In progress</h3>
+      <ul>${pending.map(x => `<li>${x.title} (Due ${x.dueDateYmd}) - ${x.status}</li>`).join('') || '<li>None</li>'}</ul>
+    `;
+
+    await sendEmail({
+      to: [client.primaryEmail],
+      cc: client.ccEmails || [],
+      bcc: client.bccEmails || [],
+      subject: `Monthly Compliance Summary - ${client.name}`,
+      html
+    });
+  }
+
+  return json(200, { ok: true });
+};
+
+
+       --- File Content End ---
+
+
+    =� manifest.json
+
+       --- File Content Start ---
+
+{"functions":[{"bundler":"zisi","buildData":{"runtimeAPIVersion":1},"mainFile":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/_auth.js","name":"_auth","priority":10,"path":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/_auth.zip","runtime":"js"},{"bundler":"zisi","buildData":{"runtimeAPIVersion":1},"mainFile":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/_common.js","name":"_common","priority":10,"path":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/_common.zip","runtime":"js"},{"bundler":"zisi","buildData":{"runtimeAPIVersion":1},"mainFile":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/clients_create.js","name":"clients_create","priority":10,"path":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/clients_create.zip","runtime":"js"},{"bundler":"zisi","buildData":{"runtimeAPIVersion":1},"mainFile":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/exports_clientHistoryXlsx.js","name":"exports_clientHistoryXlsx","priority":10,"path":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/exports_clientHistoryXlsx.zip","runtime":"js"},{"bundler":"zisi","buildData":{"runtimeAPIVersion":1},"mainFile":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/jobs_daily.js","name":"jobs_daily","priority":10,"path":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/jobs_daily.zip","runtime":"js"},{"bundler":"zisi","buildData":{"runtimeAPIVersion":1},"mainFile":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/jobs_daily5am.js","name":"jobs_daily5am","priority":10,"path":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/jobs_daily5am.zip","runtime":"js"},{"bundler":"zisi","buildData":{"runtimeAPIVersion":1},"mainFile":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/jobs_monthlysummary.js","name":"jobs_monthlysummary","priority":10,"path":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/jobs_monthlysummary.zip","runtime":"js"},{"bundler":"zisi","buildData":{"runtimeAPIVersion":1},"mainFile":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/ping.js","name":"ping","priority":10,"path":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/ping.zip","runtime":"js"},{"bundler":"zisi","buildData":{"runtimeAPIVersion":1},"mainFile":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/settings_get.js","name":"settings_get","priority":10,"path":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/settings_get.zip","runtime":"js"},{"bundler":"zisi","buildData":{"runtimeAPIVersion":1},"mainFile":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/settings_update.js","name":"settings_update","priority":10,"path":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/settings_update.zip","runtime":"js"},{"bundler":"zisi","buildData":{"runtimeAPIVersion":1},"mainFile":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/tasks_bulkimportcsv.js","name":"tasks_bulkimportcsv","priority":10,"path":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/tasks_bulkimportcsv.zip","runtime":"js"},{"bundler":"zisi","buildData":{"runtimeAPIVersion":1},"mainFile":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/tasks_createone.js","name":"tasks_createone","priority":10,"path":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/tasks_createone.zip","runtime":"js"},{"bundler":"zisi","buildData":{"runtimeAPIVersion":1},"mainFile":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/tasks_updatestatus.js","name":"tasks_updatestatus","priority":10,"path":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/tasks_updatestatus.zip","runtime":"js"},{"bundler":"zisi","buildData":{"runtimeAPIVersion":1},"mainFile":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/tasks_uploadattachment.js","name":"tasks_uploadattachment","priority":10,"path":"/home/ubuntu/cm-oauth-setup/compliance-backend/.netlify/functions/tasks_uploadattachment.zip","runtime":"js"}],"system":{"arch":"arm64","platform":"linux"},"timestamp":1768823504510,"version":1}
+
+       --- File Content End ---
+
+
+    =� netlify.toml
+
+       --- File Content Start ---
+
+[build]
+  functions = ".netlify/functions"
+
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/:splat"
+  status = 200
+
+
+       --- File Content End ---
+
+
+
+
+       --- File Content End ---
+
+
+    =� ping.js
+
+       --- File Content Start ---
+
+exports.handler = async () => {
+  return {
+    statusCode: 200,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ok: true, msg: "ping works" })
+  };
+};
+
+
+       --- File Content End ---
+
+
+    =� settings_get.js
+
+       --- File Content Start ---
+
+const { withCors, json, db } = require('./_common');
+const { requireUser, requirePartner } = require('./_auth');
+
+exports.handler = withCors(async (event) => {
+  const authRes = await requireUser(event);
+  if (authRes.error) return authRes.error;
+  const { user } = authRes;
+
+  const p = requirePartner(event, user);
+  if (p.error) return p.error;
+
+  const snap = await db().collection('settings').doc('notifications').get();
+  const data = snap.exists ? snap.data() : null;
+
+  return json(event, 200, { ok:true, data: data || {
+    dailyInternalEmails: [],
+    dailyWindowDays: 30,
+    sendDailyToAssignees: true,
+    clientReminderDays: 15
+  }});
+});
+
+       --- File Content End ---
+
+
+    =� settings_update.js
+
+       --- File Content Start ---
+
+const { withCors, json, db, admin } = require('./_common');
+const { requireUser, requirePartner } = require('./_auth');
+
+function asEmailList(x) {
+  if (Array.isArray(x)) return x.map(s => String(s).trim()).filter(Boolean);
+  if (typeof x === 'string') return x.split(/[;,]/).map(s => s.trim()).filter(Boolean);
+  return [];
+}
+
+exports.handler = withCors(async (event) => {
+  const authRes = await requireUser(event);
+  if (authRes.error) return authRes.error;
+  const { user } = authRes;
+
+  const p = requirePartner(event, user);
+  if (p.error) return p.error;
+
+  const body = JSON.parse(event.body || '{}');
+
+  const doc = {
+    dailyInternalEmails: asEmailList(body.dailyInternalEmails),
+    dailyWindowDays: Number(body.dailyWindowDays || 30),
+    sendDailyToAssignees: body.sendDailyToAssignees !== false,
+    clientReminderDays: Number(body.clientReminderDays || 15),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedBy: user.email
+  };
+
+  await db().collection('settings').doc('notifications').set(doc, { merge: true });
+
+  return json(event, 200, { ok:true });
+});
+
+       --- File Content End ---
+
+
+    =� tasks_bulkimportcsv.js
+
+       --- File Content Start ---
+
+const { json, db, admin, calendar, ymd, addInterval, addDays, auditLog } = require('./_common');
+const { requireUser, requirePartner } = require('./_auth');
+const { parse } = require('csv-parse/sync');
+
+async function findOrCreateClientByName(clientName) {
+  const snap = await db().collection('clients').where('name', '==', clientName).limit(1).get();
+  if (!snap.empty) return snap.docs[0].id;
+
+  const ref = db().collection('clients').doc();
+  await ref.set({
+    name: clientName,
+    pan: '', gstin: '', cin: '',
+    assessmentYear: '', engagementType: '',
+    primaryEmail: '',
+    ccEmails: [], bccEmails: [],
+    driveFolderId: null,
+    createdAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+  return ref.id;
+}
+
+async function findUserUidByEmail(email) {
+  if (!email) return null;
+  const snap = await db().collection('users').where('email', '==', email).limit(1).get();
+  if (snap.empty) return null;
+  return snap.docs[0].id;
+}
+
+async function createCalendarEventForTask(taskDoc) {
+  const cal = calendar();
+  // All-day event on due date (keeps calendar clean)
+  const startDate = taskDoc.dueDateYmd;
+  const endDate = ymd(addDays(new Date(taskDoc.dueDateYmd), 1));
+
+  const res = await cal.events.insert({
+    calendarId: 'primary',
+    requestBody: {
+      summary: `${taskDoc.title}`,
+      description: `ClientId: ${taskDoc.clientId}\nStatus: ${taskDoc.status}\nDue: ${taskDoc.dueDateYmd}`,
+      start: { date: startDate },
+      end: { date: endDate }
+    }
+  });
+
+  return res.data.id;
+}
+
+exports.handler = async (event) => {
+  if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers: require('./_common').cors() };
+  if (event.httpMethod !== 'POST') return json(405, { error: 'POST only' });
+
+  const authRes = await requireUser(event);
+  if (authRes.error) return authRes.error;
+  const { user } = authRes;
+
+  const p = requirePartner(user);
+  if (p.error) return p.error;
+
+  const body = JSON.parse(event.body || '{}');
+  const csvText = body.csvText;
+  if (!csvText) return json(400, { error: 'csvText required' });
+
+  // CSV columns (recommended):
+  // Title,Client,DueDate,Recurrence,GenerateCount,TriggerDays,Type,Category,AssignedToEmail,ClientEmail
+  const records = parse(csvText, { columns: true, skip_empty_lines: true, trim: true });
+
+  let created = 0;
+
+  for (const r of records) {
+    const title = r.Title;
+    const clientName = r.Client;
+    const dueDateBase = new Date(r.DueDate); // YYYY-MM-DD
+    const recurrence = (r.Recurrence || 'AD_HOC').toUpperCase();
+    const generateCount = parseInt(r.GenerateCount || '1', 10);
+    const triggerDaysBefore = parseInt(r.TriggerDays || '15', 10);
+    const type = (r.Type || 'FILING').toUpperCase();
+    const category = (r.Category || 'OTHER').toUpperCase();
+
+    const assignedEmail = r.AssignedToEmail || null;
+    const clientEmail = r.ClientEmail || null;
+
+    if (!title || !clientName || !r.DueDate) continue;
+
+    const clientId = await findOrCreateClientByName(clientName);
+
+    // If CSV included client email, update client primaryEmail if empty
+    if (clientEmail) {
+      const cRef = db().collection('clients').doc(clientId);
+      const cSnap = await cRef.get();
+      if (cSnap.exists && !cSnap.data().primaryEmail) {
+        await cRef.update({ primaryEmail: clientEmail });
+      }
+    }
+
+    const assignedToUid = (await findUserUidByEmail(assignedEmail)) || user.uid;
+
+    for (let i = 0; i < generateCount; i++) {
+      const dueDate = addInterval(dueDateBase, recurrence, i);
+      const dueDateYmd = ymd(dueDate);
+      const startDate = addDays(dueDate, -triggerDaysBefore);
+      const startDateYmd = ymd(startDate);
+
+      const tRef = db().collection('tasks').doc();
+
+      const taskDoc = {
+        clientId,
+        title,
+        category,
+        type,
+        recurrence,
+        dueDate: admin.firestore.Timestamp.fromDate(dueDate),
+        dueDateYmd,
+        triggerDaysBefore,
+        startDate: admin.firestore.Timestamp.fromDate(startDate),
+        startDateYmd,
+        assignedToUid,
+        status: 'PENDING',
+        delayReason: null,
+        delayNotes: '',
+        calendarEventId: null,
+        createdByUid: user.uid,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        completedRequestedAt: null,
+        completedAt: null,
+        escalation: { startSent: false, d7: false, d3: false, d0: false, overdue: false },
+        attachments: []
+      };
+
+      // Create calendar event now
+      const calendarEventId = await createCalendarEventForTask(taskDoc);
+      taskDoc.calendarEventId = calendarEventId;
+
+      await tRef.set(taskDoc);
+
+      await auditLog({
+        taskId: tRef.id,
+        action: 'TASK_CREATED',
+        actorUid: user.uid,
+        actorEmail: user.email,
+        details: { source: 'CSV', recurrence, dueDateYmd }
+      });
+
+      created++;
+    }
+  }
+
+  return json(200, { ok: true, created });
+};
+
+
+       --- File Content End ---
+
+
+    =� tasks_createone.js
+
+       --- File Content Start ---
+
+const { withCors, json, db, admin, calendar, ymd, addDays, auditLog } = require('./_common');
+const { requireUser, requirePartner } = require('./_auth');
+
+async function findOrCreateClientByIdOrName({ clientId, clientName, clientEmail }) {
+  if (clientId) {
+    const cRef = db().collection('clients').doc(clientId);
+    const cSnap = await cRef.get();
+    if (!cSnap.exists) throw new Error('Client not found: ' + clientId);
+
+    // optional: if email provided and empty in DB
+    if (clientEmail && !cSnap.data().primaryEmail) {
+      await cRef.update({ primaryEmail: clientEmail });
+    }
+    return clientId;
+  }
+
+  if (!clientName) throw new Error('clientId or clientName required');
+
+  const snap = await db().collection('clients').where('name', '==', clientName).limit(1).get();
+  if (!snap.empty) {
+    const id = snap.docs[0].id;
+    const cRef = db().collection('clients').doc(id);
+    const cSnap = await cRef.get();
+    if (clientEmail && cSnap.exists && !cSnap.data().primaryEmail) await cRef.update({ primaryEmail: clientEmail });
+    return id;
+  }
+
+  const ref = db().collection('clients').doc();
+  await ref.set({
+    name: clientName,
+    primaryEmail: clientEmail || '',
+    ccEmails: [],
+    bccEmails: [],
+    createdAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+  return ref.id;
+}
+
+async function findUserUidByEmail(email) {
+  if (!email) return null;
+  const snap = await db().collection('users').where('email', '==', email).limit(1).get();
+  if (snap.empty) return null;
+  return snap.docs[0].id;
+}
+
+exports.handler = withCors(async (event) => {
+  const authRes = await requireUser(event);
+  if (authRes.error) return authRes.error;
+  const { user } = authRes;
+
+  const p = requirePartner(event, user);
+  if (p.error) return p.error;
+
+  const body = JSON.parse(event.body || '{}');
+
+  const clientId = await findOrCreateClientByIdOrName({
+    clientId: body.clientId || null,
+    clientName: body.clientName || null,
+    clientEmail: body.clientEmail || null,
+  });
+
+  const dueDateYmd = body.dueDateYmd; // "YYYY-MM-DD"
+  if (!dueDateYmd) return json(event, 400, { ok:false, error:'dueDateYmd required' });
+
+  const triggerDaysBefore = Number(body.triggerDaysBefore ?? 15);
+  const startDateYmd = ymd(addDays(new Date(dueDateYmd), -triggerDaysBefore));
+
+  const assignedToEmail = body.assignedToEmail || user.email;
+  const assignedToUid = (await findUserUidByEmail(assignedToEmail)) || user.uid;
+
+  const taskDoc = {
+    clientId,
+    title: body.title || 'Untitled',
+    category: (body.category || 'OTHER').toUpperCase(),
+    type: (body.type || 'FILING').toUpperCase(),
+    recurrence: 'AD_HOC',
+
+    dueDateYmd,
+    startDateYmd,
+    triggerDaysBefore,
+
+    status: 'PENDING',
+    statusNote: '',
+    delayReason: null,
+    delayNotes: '',
+
+    assignedToUid,
+    assignedToEmail,
+
+    internalExtraEmails: (body.internalExtraEmails || '').split(/[;,]/).map(x=>x.trim()).filter(Boolean),
+
+    // client reminder flag (D-15)
+    clientReminderSent: false,
+
+    // calendar link
+    calendarEventId: null,
+
+    createdByUid: user.uid,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+
+    attachments: []
+  };
+
+  // Create calendar event (range start->due+1 so it "spans" the working window)
+  const cal = calendar();
+  const endDateYmd = ymd(addDays(new Date(dueDateYmd), 1));
+
+  const created = await cal.events.insert({
+    calendarId: 'primary',
+    sendUpdates: 'none', // IMPORTANT: no auto email invites
+    requestBody: {
+      summary: `${taskDoc.title} (Due ${dueDateYmd})`,
+      start: { date: startDateYmd },
+      end: { date: endDateYmd },
+      description: `ClientId: ${clientId}\nStatus: ${taskDoc.status}\nStart: ${startDateYmd}\nDue: ${dueDateYmd}`
+    }
+  });
+
+  taskDoc.calendarEventId = created.data.id;
+
+  const tRef = db().collection('tasks').doc();
+  await tRef.set(taskDoc);
+
+  await auditLog({ taskId: tRef.id, action:'TASK_CREATED', actorUid:user.uid, actorEmail:user.email, details:{ source:'UI_CREATE_ONE' } });
+
+  return json(event, 200, { ok:true, taskId: tRef.id });
+});
+
+       --- File Content End ---
+
+
+    =� tasks_updatestatus.js
+
+       --- File Content Start ---
+
+const { withCors, json, db, admin, calendar, sendEmail, auditLog } = require('./_common');
+const { requireUser } = require('./_auth');
+
+exports.handler = withCors(async (event) => {
+  const authRes = await requireUser(event);
+  if (authRes.error) return authRes.error;
+  const { user } = authRes;
+
+  const body = JSON.parse(event.body || '{}');
+  const { taskId, newStatus, statusNote, delayReason, delayNotes } = body;
+  if (!taskId || !newStatus) return json(event, 400, { ok:false, error:'taskId,newStatus required' });
+
+  const tRef = db().collection('tasks').doc(taskId);
+  const tSnap = await tRef.get();
+  if (!tSnap.exists) return json(event, 404, { ok:false, error:'Task not found' });
+
+  const task = tSnap.data();
+  const isPartner = user.role === 'PARTNER';
+  const isAssignee = task.assignedToUid === user.uid;
+  if (!isPartner && !isAssignee) return json(event, 403, { ok:false, error:'Not allowed' });
+
+  if (!isPartner && newStatus === 'COMPLETED') {
+    return json(event, 403, { ok:false, error:'Only partner can mark COMPLETED' });
+  }
+
+  const updates = {
+    status: newStatus,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  if (typeof statusNote === 'string') updates.statusNote = statusNote;
+  if (delayReason) updates.delayReason = delayReason;
+  if (typeof delayNotes === 'string') updates.delayNotes = delayNotes;
+
+  if (newStatus === 'APPROVAL_PENDING') updates.completedRequestedAt = admin.firestore.FieldValue.serverTimestamp();
+  if (newStatus === 'COMPLETED') updates.completedAt = admin.firestore.FieldValue.serverTimestamp();
+
+  await tRef.update(updates);
+
+  await auditLog({
+    taskId,
+    action: 'STATUS_CHANGE',
+    actorUid: user.uid,
+    actorEmail: user.email,
+    details: { from: task.status, to: newStatus, statusNote: statusNote || '' }
+  });
+
+  // On completion: email client (only)
+  if (newStatus === 'COMPLETED') {
+    // Patch calendar (no guest mails)
+    if (task.calendarEventId) {
+      try {
+        await calendar().events.patch({
+          calendarId: 'primary',
+          eventId: task.calendarEventId,
+          sendUpdates: 'none',
+          requestBody: { summary: `[COMPLETED] ${task.title} (Due ${task.dueDateYmd})`, colorId: '2' }
+        });
+      } catch (e) {}
+    }
+
+    const cSnap = await db().collection('clients').doc(task.clientId).get();
+    const client = cSnap.exists ? cSnap.data() : {};
+    const to = client.primaryEmail ? [client.primaryEmail] : [];
+
+    // IMPORTANT: no daily mails to clients. Only this completion mail and D-15 reminder.
+    if (to.length) {
+      await sendEmail({
+        to,
+        cc: [], bcc: [],
+        subject: `Completed: ${task.title} (${client.name || ''})`,
+        html: `
+          <p>Compliance completed.</p>
+          <p><b>${task.title}</b></p>
+          <p>Client: ${client.name || '-'}</p>
+          <p>Due: ${task.dueDateYmd}</p>
+          <p>Status Note: ${updates.statusNote || task.statusNote || ''}</p>
+        `
+      });
+      await auditLog({ taskId, action:'EMAIL_SENT', actorUid:null, actorEmail:null, details:{ type:'CLIENT_COMPLETION' } });
+    }
+  }
+
+  return json(event, 200, { ok:true });
+});
+
+       --- File Content End ---
+
+
+    =� tasks_uploadattachment.js
+
+       --- File Content Start ---
+
+const Busboy = require('busboy');
+const { json, db, admin, drive, auditLog } = require('./_common');
+const { requireUser } = require('./_auth');
+
+async function ensureRootFolder() {
+  const d = drive();
+  const name = process.env.DRIVE_ROOT_FOLDER_NAME || 'ComplianceManagement';
+
+  // search existing folder by name
+  const res = await d.files.list({
+    q: `mimeType='application/vnd.google-apps.folder' and name='${name}' and trashed=false`,
+    fields: 'files(id,name)',
+    spaces: 'drive'
+  });
+
+  if (res.data.files && res.data.files.length) return res.data.files[0].id;
+
+  const created = await d.files.create({
+    requestBody: { name, mimeType: 'application/vnd.google-apps.folder' },
+    fields: 'id'
+  });
+  return created.data.id;
+}
+
+async function ensureClientFolder(clientId) {
+  const cRef = db().collection('clients').doc(clientId);
+  const cSnap = await cRef.get();
+  const client = cSnap.data();
+  if (client.driveFolderId) return client.driveFolderId;
+
+  const rootId = await ensureRootFolder();
+  const folderName = `${client.name || 'Client'}_${clientId}`;
+
+  const d = drive();
+  const created = await d.files.create({
+    requestBody: {
+      name: folderName,
+      mimeType: 'application/vnd.google-apps.folder',
+      parents: [rootId]
+    },
+    fields: 'id'
+  });
+
+  await cRef.update({ driveFolderId: created.data.id });
+  return created.data.id;
+}
+
+exports.handler = async (event) => {
+  if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers: require('./_common').cors() };
+  if (event.httpMethod !== 'POST') return json(405, { error: 'POST only' });
+
+  const authRes = await requireUser(event);
+  if (authRes.error) return authRes.error;
+  const { user } = authRes;
+
+  const busboy = Busboy({ headers: event.headers });
+
+  let taskId = null;
+  let attachmentType = 'OTHER';
+  let fileBuffer = Buffer.alloc(0);
+  let fileName = 'file';
+  let mimeType = 'application/octet-stream';
+
+  busboy.on('field', (name, val) => {
+    if (name === 'taskId') taskId = val;
+    if (name === 'type') attachmentType = val.toUpperCase();
+  });
+
+  busboy.on('file', (name, file, info) => {
+    fileName = info.filename;
+    mimeType = info.mimeType;
+    file.on('data', (d) => { fileBuffer = Buffer.concat([fileBuffer, d]); });
+  });
+
+  const done = new Promise((resolve, reject) => {
+    busboy.on('finish', resolve);
+    busboy.on('error', reject);
+  });
+
+  // Netlify sends body as base64 sometimes
+  const body = event.isBase64Encoded ? Buffer.from(event.body, 'base64') : event.body;
+  busboy.end(body);
+  await done;
+
+  if (!taskId) return json(400, { error: 'taskId required' });
+
+  const tRef = db().collection('tasks').doc(taskId);
+  const tSnap = await tRef.get();
+  if (!tSnap.exists) return json(404, { error: 'Task not found' });
+
+  const task = tSnap.data();
+  const isPartner = user.role === 'PARTNER';
+  const isAssignee = task.assignedToUid === user.uid;
+  if (!isPartner && !isAssignee) return json(403, { error: 'Not allowed' });
+
+  const folderId = await ensureClientFolder(task.clientId);
+
+  const d = drive();
+  const created = await d.files.create({
+    requestBody: { name: fileName, parents: [folderId] },
+    media: { mimeType, body: Buffer.from(fileBuffer) },
+    fields: 'id, webViewLink'
+  });
+
+  const attachment = {
+    type: attachmentType,
+    fileName,
+    mimeType,
+    driveFileId: created.data.id,
+    driveWebViewLink: created.data.webViewLink,
+    uploadedByUid: user.uid,
+    uploadedAt: admin.firestore.FieldValue.serverTimestamp()
+  };
+
+  await tRef.update({
+    attachments: admin.firestore.FieldValue.arrayUnion(attachment),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+
+  await auditLog({ taskId, action: 'ATTACHMENT_UPLOAD', actorUid: user.uid, actorEmail: user.email, details: { fileName, type: attachmentType } });
+
+  return json(200, { ok: true, attachment });
+};
+
+
+       --- File Content End ---
+

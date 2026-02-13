@@ -1,0 +1,28 @@
+name: Monthly 06:00 IST
+on:
+  schedule:
+    - cron: "30 0 1 * *"  # 00:30 UTC on 1st = 06:00 IST on 1st
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force run (ignore last run date)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger monthly job
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          JSON=$(jq -n --arg f "${FORCE:-false}" '{force: ($f=="true")}')
+          curl -sS --fail-with-body --retry 3 --retry-delay 10 \
+            -X POST "https://investigators-burlington-button-harvest.trycloudflare.com/.netlify/functions/jobs_monthlysummary" \
+            -H "x-cron-secret: ${CRON_SECRET}" \
+            -H "Content-Type: application/json" \
+            --data "$JSON"

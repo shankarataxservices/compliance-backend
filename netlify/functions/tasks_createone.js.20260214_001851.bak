@@ -1,0 +1,271 @@
+// netlify/functions/tasks_createone.js
+const {
+  withCors, json, db, admin,
+  ymdIST, dateFromYmdIST, addDays, addInterval,
+  getCalendarWindow,
+  auditLog, asEmailList,
+  createStartCalendarEvent, trySendStartMailImmediately
+} = require('./_common');
+const { requireUser } = require('./_auth');
+
+async function findOrCreateClientByIdOrName({ clientId, clientName, clientEmail }) {
+  if (clientId) {
+    const cRef = db().collection('clients').doc(clientId);
+    const cSnap = await cRef.get();
+    if (!cSnap.exists) throw new Error('Client not found: ' + clientId);
+    if (clientEmail && !cSnap.data().primaryEmail) await cRef.update({ primaryEmail: clientEmail });
+    return { id: clientId, data: cSnap.data() };
+  }
+  if (!clientName) throw new Error('clientId or clientName required');
+
+  const snap = await db().collection('clients').where('name', '==', clientName).limit(1).get();
+  if (!snap.empty) {
+    const id = snap.docs[0].id;
+    const cRef = db().collection('clients').doc(id);
+    const cSnap = await cRef.get();
+    if (clientEmail && cSnap.exists && !cSnap.data().primaryEmail) await cRef.update({ primaryEmail: clientEmail });
+    return { id, data: cSnap.data() };
+  }
+
+  const ref = db().collection('clients').doc();
+  const newData = {
+    name: clientName,
+    primaryEmail: clientEmail || '',
+    ccEmails: [],
+    bccEmails: [],
+    createdAt: admin.firestore.FieldValue.serverTimestamp()
+  };
+  await ref.set(newData);
+  return { id: ref.id, data: newData };
+}
+
+async function findUserUidByEmail(email) {
+  if (!email) return null;
+  const e = String(email).trim().toLowerCase();
+  let snap = await db().collection('users').where('emailLower', '==', e).limit(1).get();
+  if (snap.empty) snap = await db().collection('users').where('email', '==', email).limit(1).get();
+  if (snap.empty) return null;
+  return snap.docs[0].id;
+}
+
+function normalizeRecurrence(x) {
+  const r = String(x || 'AD_HOC').toUpperCase().trim();
+  const allowed = ['AD_HOC','DAILY','WEEKLY','BIWEEKLY','MONTHLY','BIMONTHLY','QUARTERLY','HALF_YEARLY','YEARLY'];
+  return allowed.includes(r) ? r : 'AD_HOC';
+}
+
+function normalizeCategory(x) {
+  const raw = String(x || 'OTHER').trim();
+  const u = raw.toUpperCase().replace(/\s+/g, '_');
+  if (u === 'ITR' || u === 'INCOME_TAX' || u === 'INCOME-TAX' || raw.toLowerCase() === 'income tax') return 'INCOME_TAX';
+  if (u === 'GST') return 'GST';
+  if (u === 'TDS') return 'TDS';
+  if (u === 'ROC') return 'ROC';
+  if (u === 'ACCOUNTING') return 'ACCOUNTING';
+  if (u === 'AUDIT') return 'AUDIT';
+  return 'OTHER';
+}
+
+function normalizePriority(x) {
+  const v = String(x || 'MEDIUM').trim().toUpperCase();
+  if (v === 'HIGH' || v === 'LOW') return v;
+  return 'MEDIUM';
+}
+
+exports.handler = withCors(async (event) => {
+  if (event.httpMethod !== 'POST') return json(event, 405, { ok:false, error:'POST only' });
+
+  const authRes = await requireUser(event);
+  if (authRes.error) return authRes.error;
+  const { user } = authRes;
+
+  // role normalization already done in _auth.js (WORKER->ASSOCIATE)
+  const role = String(user.role || 'ASSOCIATE').toUpperCase().trim();
+
+  const body = JSON.parse(event.body || '{}');
+
+  const { id: clientId, data: clientData } = await findOrCreateClientByIdOrName({
+    clientId: body.clientId || null,
+    clientName: body.clientName || null,
+    clientEmail: body.clientEmail || null,
+  });
+
+  const title = body.title || 'Untitled';
+  const dueDateYmd = String(body.dueDateYmd || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDateYmd)) {
+    return json(event, 400, { ok:false, error:'dueDateYmd required (YYYY-MM-DD)' });
+  }
+
+  const recurrence = normalizeRecurrence(body.recurrence || 'AD_HOC');
+  const generateCount = Math.max(1, parseInt(body.generateCount || '1', 10));
+  const triggerDaysBefore = Math.max(0, parseInt(body.triggerDaysBefore ?? 15, 10));
+  const category = normalizeCategory(body.category || 'OTHER');
+  const type = String(body.type || 'FILING').trim();
+  const priority = normalizePriority(body.priority || 'MEDIUM');
+
+  // Assignment rules:
+  // - ASSOCIATE: must assign to self
+  // - MANAGER/PARTNER: can assign to anyone (if email exists), otherwise fallback to self
+  let assignedToEmail = (body.assignedToEmail || user.email || '').trim();
+  let assignedToUid = user.uid;
+  if (role === 'ASSOCIATE') {
+    assignedToEmail = user.email;
+    assignedToUid = user.uid;
+  } else {
+    const uid = assignedToEmail ? (await findUserUidByEmail(assignedToEmail)) : null;
+    assignedToUid = uid || user.uid;
+    if (!uid) assignedToEmail = user.email;
+  }
+
+  // ===== Start mail control + templates + recipients =====
+  const sendClientStartMail = (body.sendClientStartMail !== false); // default true
+  const clientToEmails = asEmailList(body.clientToEmails || body.clientTo || body.clientEmail || null);
+  const clientCcEmails = asEmailList(body.clientCcEmails || body.clientCc || null);
+  const clientBccEmails = asEmailList(body.clientBccEmails || body.clientBcc || null);
+  const ccAssigneeOnClientStart = body.ccAssigneeOnClientStart === true;
+  const ccManagerOnClientStart = body.ccManagerOnClientStart === true;
+
+  // Completion settings
+  const sendClientCompletionMail = body.sendClientCompletionMail !== false;
+  const clientStartSubject = String(body.clientStartSubject || '').trim();
+  const clientStartBody = String(body.clientStartBody || '').trim();
+  const clientCompletionSubject = String(body.clientCompletionSubject || '').trim();
+  const clientCompletionBody = String(body.clientCompletionBody || '').trim();
+
+  // Completion recipient overrides (new)
+  const completionToEmails = asEmailList(body.completionToEmails || body.completionTo || null);
+  const completionCcEmails = asEmailList(body.completionCcEmails || body.completionCc || null);
+  const completionBccEmails = asEmailList(body.completionBccEmails || body.completionBcc || null);
+  const ccAssigneeOnCompletion = body.ccAssigneeOnCompletion === true;
+  const ccManagerOnCompletion = body.ccManagerOnCompletion === true;
+
+  const isSeries = recurrence !== 'AD_HOC' && generateCount > 1;
+  const seriesId = isSeries ? db().collection('taskSeries').doc().id : null;
+  const seriesCreated = seriesId ? 1 : 0;
+
+  const window = await getCalendarWindow();
+  const todayYmd = ymdIST(new Date());
+
+  let created = 0;
+
+  for (let i = 0; i < generateCount; i++) {
+    const dueDate = addInterval(dateFromYmdIST(dueDateYmd), recurrence, i);
+    const dueYmd = ymdIST(dueDate);
+    const startDate = addDays(dateFromYmdIST(dueYmd), -triggerDaysBefore);
+    const startYmd = ymdIST(startDate);
+
+    const ev = await createStartCalendarEvent({
+      title, clientId, startDateYmd: startYmd, dueDateYmd: dueYmd, window
+    });
+
+    const taskObjForMail = {
+      title,
+      startDateYmd: startYmd,
+      dueDateYmd: dueYmd,
+      sendClientStartMail,
+      clientStartSubject,
+      clientStartBody,
+      clientToEmails, clientCcEmails, clientBccEmails,
+      ccAssigneeOnClientStart, ccManagerOnClientStart,
+      assignedToEmail, assignedToUid
+    };
+
+    let mailResult = null;
+    if (startYmd === todayYmd) {
+      mailResult = await trySendStartMailImmediately({
+        task: taskObjForMail,
+        client: {
+          name: clientData.name,
+          primaryEmail: clientData.primaryEmail,
+          ccEmails: clientData.ccEmails,
+          bccEmails: clientData.bccEmails
+        },
+        window
+      });
+    }
+
+    const tRef = db().collection('tasks').doc();
+    await tRef.set({
+      clientId,
+      title,
+      category,
+      type,
+      priority,
+      recurrence,
+      seriesId,
+      occurrenceIndex: i + 1,
+      occurrenceTotal: generateCount,
+      dueDate: admin.firestore.Timestamp.fromDate(dateFromYmdIST(dueYmd)),
+      dueDateYmd: dueYmd,
+      triggerDaysBefore,
+      startDate: admin.firestore.Timestamp.fromDate(dateFromYmdIST(startYmd)),
+      startDateYmd: startYmd,
+      assignedToUid,
+      assignedToEmail,
+      status: 'PENDING',
+      statusNote: '',
+      delayReason: null,
+      delayNotes: '',
+      snoozedUntilYmd: null,
+
+      // Calendar single-event model
+      calendarEventId: ev.calendarEventId,
+      calendarHtmlLink: ev.calendarHtmlLink || null,
+      calendarStartEventId: ev.calendarEventId,
+      calendarDueEventId: null,
+
+      // Start mail fields
+      sendClientStartMail,
+      clientToEmails,
+      clientCcEmails,
+      clientBccEmails,
+      ccAssigneeOnClientStart,
+      ccManagerOnClientStart,
+      clientStartSubject,
+      clientStartBody,
+      clientStartMailSent: mailResult ? true : false,
+      clientStartMailSentAt: mailResult?.clientStartMailSentAt || null,
+      clientStartGmailThreadId: mailResult?.clientStartGmailThreadId || null,
+      clientStartGmailId: mailResult?.clientStartGmailId || null,
+      clientStartRfcMessageId: mailResult?.clientStartRfcMessageId || null,
+      clientStartReferences: mailResult?.clientStartReferences || null,
+
+      // Completion mail fields
+      sendClientCompletionMail,
+      clientCompletionSubject,
+      clientCompletionBody,
+
+      // Completion override recipients (new)
+      completionToEmails,
+      completionCcEmails,
+      completionBccEmails,
+      ccAssigneeOnCompletion,
+      ccManagerOnCompletion,
+
+      createdByUid: user.uid,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      completedRequestedAt: null,
+      completedAt: null,
+      attachments: []
+    });
+
+    await auditLog({
+      taskId: tRef.id,
+      action: 'TASK_CREATED',
+      actorUid: user.uid,
+      actorEmail: user.email,
+      details: {
+        source:'UI_CREATE',
+        seriesId,
+        occurrenceIndex: i+1,
+        startDateYmd: startYmd,
+        sentMailNow: !!mailResult
+      }
+    });
+
+    created++;
+  }
+
+  return json(event, 200, { ok:true, created, seriesId, seriesCreated });
+});
