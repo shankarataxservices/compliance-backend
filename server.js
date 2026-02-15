@@ -56,9 +56,12 @@ const FUNCTIONS = {
   // filename in your backend: settings_workerimportpassword_set.js
   settings_workerimportpassword_set: require('./netlify/functions/settings_workerimportpassword_set'),
 
-  // users
+    // users
   users_list: require('./netlify/functions/users_list'),
   users_setrole: require('./netlify/functions/users_setrole'),
+  
+  // NEW: Required for signup initialization
+  users_initself: require('./netlify/functions/users_initself'),
 
   // filenames in your backend folder (camelCase):
   users_setManager: require('./netlify/functions/users_setManager'),
