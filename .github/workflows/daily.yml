@@ -22,7 +22,7 @@ jobs:
         run: |
           JSON=$(jq -n --arg f "${FORCE:-false}" '{force: ($f=="true")}')
           curl -sS --fail-with-body --retry 3 --retry-delay 10 \
-            -X POST "https://investigators-burlington-button-harvest.trycloudflare.com/.netlify/functions/jobs_daily5am" \
+            -X POST "https://lease-moore-others-montreal.trycloudflare.com/.netlify/functions/jobs_daily5am" \
             -H "x-cron-secret: ${CRON_SECRET}" \
             -H "Content-Type: application/json" \
             --data "$JSON"
